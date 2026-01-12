@@ -28,14 +28,14 @@ IBEX35_TICKERS = list(NOMBRES_IBEX.keys())
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("🎯 Gatillos de Operativa")
-    buy_score = st.slider("Score Compra (Gatillo)", 40, 90, 60)
-    sell_score = st.slider("Score Venta (Salida)", 20, 60, 40)
+    buy_score = st.slider("Score Compra (Gatillo)", 40, 90, 70)
+    sell_score = st.slider("Score Venta (Salida)", 20, 60, 30)
     
     st.header("🛠️ Configuración del Score")
     with st.expander("📈 Tendencia", expanded=True):
         p_sma_bull_cross = st.slider("Precio > SMA50 > SMA200", 0, 50, 50)
-        p_sma_bull_simple = st.slider("Precio > SMA50 y SMA200", 0, 50, 35)
-        p_sma_min = st.slider("Precio > SMA200 solamente", 0, 30, 15)
+        p_sma_bull_simple = st.slider("Precio > SMA50 y SMA200", 0, 50, 50)
+        p_sma_min = st.slider("Precio > SMA200 solamente", 0, 30, 30)
         
     with st.expander("🚀 Momentum (RSI 21)"):
         rsi_range = st.slider("Rango Ideal (Puntos Max)", 0, 100, (60, 75))
