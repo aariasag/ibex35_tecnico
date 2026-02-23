@@ -35,7 +35,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🦅 IBEX 35 — Sistema Swing Trading Experto v2.0")
+st.title("🦅 IBEX 35 — Sistema Swing Trading Experto v3.0")
 
 # --- DATOS ESTÁTICOS ---
 NOMBRES_IBEX = {
@@ -103,16 +103,41 @@ def calcular_volume_ratio(df, period=20):
     vol_ma = df['Volume'].rolling(period).mean()
     return df['Volume'] / vol_ma
 
-def calcular_breakout_signal(df, lookback=20):
+def calcular_breakout_signal(df, lookback=20, vol_threshold=1.5):
     """
     Detecta rotura alcista: precio cierra por encima del máximo de las últimas `lookback` velas
-    con volumen expandido (ratio > 1.5).
+    con volumen expandido (ratio > vol_threshold).
     Retorna Serie booleana.
     """
     prev_high = df['High'].shift(1).rolling(lookback).max()
     vol_ratio = calcular_volume_ratio(df)
-    breakout = (df['Close'] > prev_high) & (vol_ratio > 1.5)
+    breakout = (df['Close'] > prev_high) & (vol_ratio > vol_threshold)
     return breakout, prev_high, vol_ratio
+
+def calcular_rs_vs_ibex(df_ticker, df_ibex, period=20):
+    """
+    Fortaleza Relativa (RS) del activo vs el IBEX 35.
+    RS = rendimiento del activo en `period` días / rendimiento del IBEX en `period` días.
+    RS > 1.0  → el activo supera al índice → señal positiva
+    RS < 1.0  → el activo va peor que el índice → señal negativa
+
+    Esta métrica captura exactamente lo que el RSI no puede: si el precio
+    del activo está subiendo MÁS que el mercado en conjunto, hay dinero
+    institucional posicionándose en él específicamente.
+    """
+    ret_ticker = df_ticker['Close'].pct_change(period)
+    ret_ibex   = df_ibex['Close'].pct_change(period).reindex(df_ticker.index, method='ffill')
+    # Evitar división por cero cuando el IBEX no se mueve
+    rs = (1 + ret_ticker) / (1 + ret_ibex.replace(0, np.nan))
+    return rs
+
+def calcular_rsi_prebreakout(rsi_series, ventana=5):
+    """
+    RSI medio de los N días ANTERIORES al día actual (no incluye el día actual).
+    Mide si el activo estaba en zona de acumulación sana ANTES de la rotura,
+    sin penalizar el RSI alto que inevitablemente acompaña a la rotura misma.
+    """
+    return rsi_series.shift(1).rolling(ventana).mean()
 
 # =============================================================================
 # 2. FILTRO DE RÉGIMEN DE MERCADO (IBEX INDEX)
@@ -141,7 +166,7 @@ def get_market_regime():
 # 3. LÓGICA DE SCORING (MEJORADA)
 # =============================================================================
 
-def analizar_ticker(ticker, df_diario, config, market_bullish=True):
+def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None):
     try:
         if len(df_diario) < 260:
             return None
@@ -160,29 +185,48 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True):
         weekly_trend_bullish = weekly_close > weekly_ema30
 
         # --- MARCO DIARIO ---
-        close = df_diario['Close'].iloc[-1]
-        sma50 = df_diario['Close'].rolling(50).mean().iloc[-1]
+        close  = df_diario['Close'].iloc[-1]
+        sma50  = df_diario['Close'].rolling(50).mean().iloc[-1]
         sma200 = df_diario['Close'].rolling(200).mean().iloc[-1]
-        rsi = calcular_rsi(df_diario['Close'], 14).iloc[-1]
+
+        # RSI completo — para información y scoring de contexto
+        rsi_series  = calcular_rsi(df_diario['Close'], 14)
+        rsi_actual  = rsi_series.iloc[-1]
+
+        # RSI PRE-ROTURA: media de los 5 días anteriores al día actual
+        # Mide si el activo estaba "descansando" antes del impulso actual
+        rsi_pre     = calcular_rsi_prebreakout(rsi_series, ventana=5).iloc[-1]
+
         atr = calcular_atr_series(df_diario, 14).iloc[-1]
         adx, plus_di, minus_di = calcular_adx(df_diario, 14)
-        adx_val = adx.iloc[-1]
-        plus_di_val = plus_di.iloc[-1]
+        adx_val      = adx.iloc[-1]
+        plus_di_val  = plus_di.iloc[-1]
         minus_di_val = minus_di.iloc[-1]
 
         # --- VOLUMEN ---
-        obv = calcular_obv(df_diario)
-        obv_sma = obv.rolling(20).mean()
+        obv         = calcular_obv(df_diario)
+        obv_sma     = obv.rolling(20).mean()
         obv_bullish = obv.iloc[-1] > obv_sma.iloc[-1]
-        vol_ratio = calcular_volume_ratio(df_diario).iloc[-1]
+        vol_ratio   = calcular_volume_ratio(df_diario).iloc[-1]
+
+        # --- FORTALEZA RELATIVA VS IBEX ---
+        rs_val      = None
+        rs_bullish  = False
+        rs_20d      = None
+        if df_ibex is not None and not df_ibex.empty:
+            rs_series  = calcular_rs_vs_ibex(df_diario, df_ibex, period=20)
+            rs_val     = rs_series.iloc[-1]
+            rs_bullish = bool(rs_val > 1.0) if rs_val is not None and not np.isnan(rs_val) else False
+            rs_20d     = rs_val
 
         # --- DISPARADOR DE ENTRADA ---
-        breakout_series, prev_high_series, vol_ratio_series = calcular_breakout_signal(df_diario)
+        vol_thr = config.get('vol_threshold', 1.5)
+        breakout_series, prev_high_series, vol_ratio_series = calcular_breakout_signal(df_diario, vol_threshold=vol_thr)
         breakout_today = breakout_series.iloc[-1]
-        prev_high_val = prev_high_series.iloc[-1]
+        prev_high_val  = prev_high_series.iloc[-1]
 
         # --- SCORING ---
-        score = 0
+        score     = 0
         score_log = []
 
         # FILTRO MAESTRO: Régimen de mercado
@@ -204,147 +248,212 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True):
 
         # 1. Tendencia semanal
         if weekly_trend_bullish:
-            pts = 25
-            score += pts
+            pts = 25; score += pts
             score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🟢 Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({weekly_close:.2f}) > EMA30 ({weekly_ema30:.2f})"})
         else:
-            pts = -20
-            score += pts
+            pts = -20; score += pts
             score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🔴 Bajista", "Puntos": f"{pts}", "Detalle": f"Precio ({weekly_close:.2f}) < EMA30 ({weekly_ema30:.2f})"})
 
         # 2. SMA 200
         if close > sma200:
-            pts = 20
-            score += pts
+            pts = 20; score += pts
             score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "✅ Sobre soporte", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA200 ({sma200:.2f})"})
         else:
-            pts = -15
-            score += pts
+            pts = -15; score += pts
             score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "❌ Bajo soporte", "Puntos": f"{pts}", "Detalle": f"Precio ({close:.2f}) < SMA200 ({sma200:.2f})"})
 
         # 3. SMA50
         if close > sma50:
-            pts = 10
-            score += pts
+            pts = 10; score += pts
             score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "✅ Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA50 ({sma50:.2f})"})
         else:
             score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "❌ Bajista", "Puntos": "0", "Detalle": f"Precio ({close:.2f}) < SMA50 ({sma50:.2f})"})
 
         # 4. ADX + DI direccional
         if adx_val > 25 and plus_di_val > minus_di_val:
-            pts = 15
-            score += pts
+            pts = 15; score += pts
             score_log.append({"Regla": "Fuerza Direccional (ADX + DI+)", "Valor": "💪 Fuerte Alcista", "Puntos": f"+{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 y DI+ ({plus_di_val:.1f}) > DI- ({minus_di_val:.1f})"})
         elif adx_val > 25 and plus_di_val < minus_di_val:
-            pts = -10
-            score += pts
+            pts = -10; score += pts
             score_log.append({"Regla": "Fuerza Direccional (ADX + DI-)", "Valor": "⚠️ Fuerte Bajista", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 pero DI- ({minus_di_val:.1f}) domina"})
         elif adx_val < 20:
-            pts = -5
-            score += pts
+            pts = -5; score += pts
             score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "😴 Débil/Lateral", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) < 20 — Mercado sin dirección"})
         else:
             score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"ADX ({adx_val:.1f}) en zona neutra (20-25)"})
 
-        # 5. RSI (CORREGIDO: zona pullback 40-60 es la oportunidad real)
-        if 40 <= rsi <= 60:
-            pts = 15
-            score += pts
-            score_log.append({"Regla": "Momentum RSI (Pullback)", "Valor": "🎯 Zona de Entrada", "Puntos": f"+{pts}", "Detalle": f"RSI ({rsi:.1f}) en zona óptima pullback (40-60)"})
-        elif 60 < rsi <= 70:
-            pts = 5
-            score += pts
-            score_log.append({"Regla": "Momentum RSI", "Valor": "🟡 Movimiento avanzado", "Puntos": f"+{pts}", "Detalle": f"RSI ({rsi:.1f}) — el movimiento ya está parcialmente hecho"})
-        elif rsi > 75:
-            pts = -10
-            score += pts
-            score_log.append({"Regla": "Momentum RSI", "Valor": "🔴 Sobrecompra", "Puntos": f"{pts}", "Detalle": f"RSI ({rsi:.1f}) > 75 — Riesgo de corrección"})
-        elif rsi < 40:
-            pts = -10
-            score += pts
-            score_log.append({"Regla": "Momentum RSI", "Valor": "🔴 Debilidad", "Puntos": f"{pts}", "Detalle": f"RSI ({rsi:.1f}) < 40 — Momentum negativo"})
+        # 5. RSI — CORREGIDO v3:
+        # Se evalúa el RSI PRE-ROTURA (5 días anteriores), no el RSI actual.
+        # Razón: en el día de la rotura el RSI DEBE estar alto (el precio está
+        # rompiendo máximos). Penalizarlo era una contradicción lógica.
+        # Lo que sí queremos saber es si los días anteriores el activo estaba
+        # en zona sana (40-68), indicando acumulación antes del impulso.
+        if not np.isnan(rsi_pre):
+            if 45 <= rsi_pre <= 68:
+                pts = 15; score += pts
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🎯 Acumulación Sana", "Puntos": f"+{pts}", "Detalle": f"RSI medio 5d previos ({rsi_pre:.1f}) en zona óptima 45-68 — consolidación antes del impulso"})
+            elif rsi_pre > 78:
+                pts = -10; score += pts
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🔴 Ya Agotado", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) > 78 — el activo llegó a la rotura sobrecomprado"})
+            elif rsi_pre < 40:
+                pts = -5; score += pts
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "⚠️ Momentum Débil", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) < 40 — poco momentum antes de la rotura"})
+            else:
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"RSI previo ({rsi_pre:.1f}) — zona aceptable"})
+            # RSI actual informativo (no penaliza)
+            score_log.append({"Regla": "  ↳ RSI Actual (solo informativo)", "Valor": "—", "Puntos": "0", "Detalle": f"RSI hoy: {rsi_actual:.1f} — esperado alto en día de rotura, no penaliza"})
         else:
-            score_log.append({"Regla": "Momentum RSI", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"RSI ({rsi:.1f})"})
+            score_log.append({"Regla": "RSI Pre-Rotura", "Valor": "⚪ Sin datos", "Puntos": "0", "Detalle": "Datos insuficientes"})
 
         # 6. OBV — Volumen confirma dirección
         if obv_bullish:
-            pts = 10
-            score += pts
+            pts = 10; score += pts
             score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🟢 Compradora", "Puntos": f"+{pts}", "Detalle": "OBV por encima de su SMA20 — dinero entrando"})
         else:
-            pts = -5
-            score += pts
+            pts = -5; score += pts
             score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🔴 Vendedora", "Puntos": f"{pts}", "Detalle": "OBV por debajo de su SMA20 — distribución"})
 
-        # 7. Zona de Valor (pullback a SMA50)
+        # 7. FORTALEZA RELATIVA VS IBEX (NUEVO v3)
+        if rs_val is not None and not np.isnan(rs_val):
+            if rs_val > 1.05:
+                pts = 15; score += pts
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟢 Líder de Mercado", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — sube {(rs_val-1)*100:.1f}% más que el IBEX. Dinero institucional entrando."})
+            elif rs_val > 1.0:
+                pts = 8; score += pts
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟡 Supera al Índice", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — ligeramente por encima del IBEX"})
+            elif rs_val > 0.95:
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ En línea con Índice", "Puntos": "0", "Detalle": f"RS 20d = {rs_val:.3f} — movimiento similar al IBEX"})
+            else:
+                pts = -10; score += pts
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🔴 Rezagado", "Puntos": f"{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — el activo cae más (o sube menos) que el IBEX. Evitar."})
+        else:
+            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ Sin datos IBEX", "Puntos": "0", "Detalle": "No se pudo calcular sin datos del índice"})
+
+        # 8. Zona de Valor (pullback a SMA50)
         dist_sma50 = (close - sma50) / sma50
         if 0 < dist_sma50 < 0.05:
-            pts = 10
-            score += pts
+            pts = 5; score += pts
             score_log.append({"Regla": "Zona de Valor (Pullback SMA50)", "Valor": "🎯 Oportunidad", "Puntos": f"+{pts}", "Detalle": f"Precio dentro del 5% de SMA50 — zona de rebote potencial"})
 
-        # 8. Disparador de entrada: rotura con volumen
+        # 9. Disparador de entrada: rotura con volumen
         if breakout_today:
-            pts = 15
-            score += pts
+            pts = 15; score += pts
             score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "✅ ROTURA ACTIVA", "Puntos": f"+{pts}", "Detalle": f"Cierre ({close:.2f}€) > Máx. 20 días ({prev_high_val:.2f}€) con volumen x{vol_ratio:.1f}"})
         else:
             score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "⏳ Sin rotura", "Puntos": "0", "Detalle": f"Precio aún no supera máx. 20 días ({prev_high_val:.2f}€)"})
 
         # --- GESTIÓN DE RIESGO ---
-        stop_loss = close - (atr * config['atr_mult'])
+        stop_loss     = close - (atr * config['atr_mult'])
         risk_per_share = close - stop_loss
-        risk_pct = (risk_per_share / close) * 100
-
-        # Target dinámico: nivel de resistencia o 2R (lo que sea menor para ser conservador)
-        target_fixed = close + (risk_per_share * config['rr_ratio'])
-        high_52w = df_diario['High'].rolling(252).max().iloc[-1]
-        target = min(target_fixed, high_52w * 0.98) if target_fixed > high_52w * 0.95 else target_fixed
+        risk_pct      = (risk_per_share / close) * 100
+        target_fixed  = close + (risk_per_share * config['rr_ratio'])
+        high_52w      = df_diario['High'].rolling(252).max().iloc[-1]
+        target        = min(target_fixed, high_52w * 0.98) if target_fixed > high_52w * 0.95 else target_fixed
 
         return {
-            "Ticker": ticker.replace(".MC", ""),
-            "Empresa": NOMBRES_IBEX.get(ticker, ticker),
-            "Precio": close,
-            "Score": round(score),
+            "Ticker":           ticker.replace(".MC", ""),
+            "Empresa":          NOMBRES_IBEX.get(ticker, ticker),
+            "Precio":           close,
+            "Score":            round(score),
             "Tendencia Semanal": "🟢 Alcista" if weekly_trend_bullish else "🔴 Bajista",
-            "Régimen Mercado": "🟢 Alcista" if market_bullish else "🔴 Bajista",
-            "SMA200": sma200,
-            "SMA50": sma50,
-            "ADX": adx_val,
-            "DI+": plus_di_val,
-            "DI-": minus_di_val,
-            "RSI(14)": rsi,
-            "OBV Alcista": obv_bullish,
-            "Vol Ratio": vol_ratio,
-            "Rotura": "🚨 SÍ" if breakout_today else "—",
-            "Stop Loss": stop_loss,
-            "Target": target,
-            "Riesgo %": risk_pct,
-            "ATR": atr,
-            "Score_Log": score_log,
-            "_df": df_diario  # para gráfico
+            "Régimen Mercado":  "🟢 Alcista" if market_bullish else "🔴 Bajista",
+            "SMA200":           sma200,
+            "SMA50":            sma50,
+            "ADX":              adx_val,
+            "DI+":              plus_di_val,
+            "DI-":              minus_di_val,
+            "RSI Actual":       rsi_actual,
+            "RSI Pre-Rotura":   round(rsi_pre, 1) if not np.isnan(rsi_pre) else None,
+            "RS vs IBEX":       round(rs_val, 3) if rs_val and not np.isnan(rs_val) else None,
+            "OBV Alcista":      obv_bullish,
+            "Vol Ratio":        vol_ratio,
+            "Rotura":           "🚨 SÍ" if breakout_today else "—",
+            "Stop Loss":        stop_loss,
+            "Target":           target,
+            "Riesgo %":         risk_pct,
+            "ATR":              atr,
+            "Score_Log":        score_log,
+            "_df":              df_diario
         }
     except Exception as e:
         return None
 
 # =============================================================================
-# 4. BACKTESTING VECTORIZADO
+# 4. BACKTESTING VECTORIZADO v4 — Profit Factor Maximizado
 # =============================================================================
+#
+# MEJORAS ACTIVAS (acumulativas sobre versiones anteriores):
+#
+# [A] SALIDA PARCIAL 1R + STOP BREAKEVEN
+#     50% cierra en 1R, stop restante → precio entrada. Elimina pérdidas
+#     en trades que "casi llegan" y vuelven.
+#
+# [B] FILTRO ATR MÍNIMO (configurable)
+#     Descarta activos inertes que raramente alcanzan el target.
+#
+# [C] UMBRAL DE VOLUMEN CONFIGURABLE
+#     Parámetro ajustable desde sidebar.
+#
+# [D] TARGET DINÁMICO SEGÚN ADX
+#     ADX > 35 en entrada → target 3R en vez de 2R.
+#
+# [E] RSI PRE-ROTURA (v3)
+#     Evalúa RSI de los 5 días anteriores, no el del día de rotura.
+#     Elimina la contradicción RSI-alto vs precio-rompiendo-máximos.
+#
+# [F] FORTALEZA RELATIVA VS IBEX (v3)
+#     Sólo entra si el activo supera al índice en los últimos 20 días.
+#     Filtra roturas por inercia de mercado (baja calidad).
+#
+# [G] CONFIRMACIÓN SEMANAL DE ROTURA (NUEVO)
+#     La rotura diaria debe coincidir con que el precio también supere
+#     el máximo de las últimas 8 semanas en el cierre semanal más reciente.
+#     Elimina roturas falsas que son ruido dentro de un rango lateral mayor.
+#
+# [H] LÍMITE DE CONCENTRACIÓN SECTORIAL (NUEVO)
+#     Máximo 1 posición abierta por sector simultáneamente.
+#     Los bancos del IBEX están altamente correlacionados: abrir BBVA,
+#     Santander y CaixaBank a la vez es en realidad una sola apuesta triple.
+#     Este filtro reduce el riesgo concentrado sin reducir el número de señales
+#     totales a largo plazo (simplemente las escala en el tiempo).
+#
+# [I] STOP MÍNIMO GARANTIZADO (NUEVO)
+#     El stop trailing nunca sube tan rápido que deje menos de 0.5R de
+#     espacio al precio actual. Evita que el trailing agresivo cierre
+#     trades ganadores en retrocesos normales antes de llegar al target.
+
+# Mapa de sectores para filtro de concentración
+SECTOR_MAP = {}
+for sector, tickers in {
+    "Utilities":   ["IBE.MC","ELE.MC","REP.MC","NTGY.MC","ENG.MC","RED.MC","ANE.MC","SLR.MC"],
+    "Bancos":      ["BBVA.MC","SAN.MC","CABK.MC","SAB.MC","BKT.MC","UNI.MC","MAP.MC"],
+    "Industria":   ["ACS.MC","FER.MC","ANA.MC","SCYR.MC","IDR.MC","MTS.MC","FDR.MC","ACX.MC"],
+    "Consumo":     ["ITX.MC","ROVI.MC","PUIG.MC","LOG.MC","GRF.MC","IAG.MC","AMS.MC"],
+    "RealEstate":  ["TEF.MC","MRL.MC","COL.MC","CLNX.MC"],
+    "Aeropuertos": ["AENA.MC"],
+}.items():
+    for t in tickers:
+        SECTOR_MAP[t] = sector
+
 
 def run_backtest(df_raw, config, market_regime_df=None):
     """
-    Backtesting vectorizado sobre datos históricos.
-    Lógica:
-    - Señal de ENTRADA: precio cierra por encima del máximo de 20 días con volumen expandido
-      + EMA30 semanal alcista + RSI entre 30 y 70.
-    - Filtro régimen: IBEX > SMA200.
-    - SALIDA: Stop Loss (2xATR trailing) o Target (2R fijo).
-    - Se simula operación a operación, una posición a la vez.
+    Backtesting multi-activo con gestión de cartera real:
+    - Simula todas las señales de todos los tickers en paralelo cronológico
+    - Aplica filtro de concentración sectorial (máx 1 posición por sector)
+    - Todas las demás mejoras A-I activas
     """
-    results = []
-    all_trades_df = []
+    vol_threshold  = config.get('vol_threshold', 1.5)
+    atr_min_pct    = config.get('atr_min_pct', 1.0)
+    partial_exit   = config.get('partial_exit', True)
+    adx_dynamic_rr = config.get('adx_dynamic_rr', True)
+    sector_limit   = config.get('sector_limit', True)   # [H]
+    weekly_confirm = config.get('weekly_confirm', True)  # [G]
 
     tickers = [t for t in df_raw.columns.get_level_values(0).unique() if t in IBEX35_TICKERS]
+
+    # ── PASO 1: Precalcular indicadores y señales para todos los tickers ──────
+    ticker_data = {}   # ticker → DataFrame con señales
 
     for ticker in tickers:
         try:
@@ -352,115 +461,255 @@ def run_backtest(df_raw, config, market_regime_df=None):
             if len(df) < 300:
                 continue
 
-            # Indicadores
-            df['SMA200'] = df['Close'].rolling(200).mean()
-            df['SMA50'] = df['Close'].rolling(50).mean()
-            df['RSI'] = calcular_rsi(df['Close'], 14)
-            df['ATR'] = calcular_atr_series(df, 14)
-            df['OBV'] = calcular_obv(df)
-            df['OBV_SMA'] = df['OBV'].rolling(20).mean()
+            df['SMA200']   = df['Close'].rolling(200).mean()
+            df['SMA50']    = df['Close'].rolling(50).mean()
+            df['RSI']      = calcular_rsi(df['Close'], 14)
+            df['ATR']      = calcular_atr_series(df, 14)
+            df['ATR_PCT']  = (df['ATR'] / df['Close']) * 100
+            df['OBV']      = calcular_obv(df)
+            df['OBV_SMA']  = df['OBV'].rolling(20).mean()
             df['VolRatio'] = calcular_volume_ratio(df)
+            df['RSI_PRE']  = calcular_rsi_prebreakout(df['RSI'], ventana=5)
 
-            # Semanal EMA30
+            adx_s, _, _    = calcular_adx(df, 14)
+            df['ADX']      = adx_s
+
+            # EMA30 semanal
             df_w = df.resample('W').agg({
                 'Open': 'first', 'High': 'max', 'Low': 'min',
                 'Close': 'last', 'Volume': 'sum'
             }).dropna()
-            df_w['EMA30'] = df_w['Close'].ewm(span=30).mean()
+            df_w['EMA30']       = df_w['Close'].ewm(span=30).mean()
             df_w['WeeklyTrend'] = df_w['Close'] > df_w['EMA30']
-            weekly_trend = df_w['WeeklyTrend'].resample('D').ffill()
-            df['WeeklyTrend'] = weekly_trend.reindex(df.index, method='ffill')
+
+            # [G] Confirmación semanal: cierre semanal > máximo de las 8 semanas anteriores
+            df_w['WeekHigh8']       = df_w['High'].shift(1).rolling(8).max()
+            df_w['WeeklyBreakout']  = df_w['Close'] > df_w['WeekHigh8']
+
+            weekly_trend   = df_w['WeeklyTrend'].resample('D').ffill()
+            weekly_bo      = df_w['WeeklyBreakout'].resample('D').ffill()
+            df['WeeklyTrend']    = weekly_trend.reindex(df.index, method='ffill')
+            df['WeeklyBreakout'] = weekly_bo.reindex(df.index, method='ffill')
 
             # Régimen IBEX
             if market_regime_df is not None and not market_regime_df.empty:
-                ibex_sma200 = market_regime_df['Close'].rolling(200).mean()
-                ibex_regime = (market_regime_df['Close'] > ibex_sma200)
+                ibex_sma200    = market_regime_df['Close'].rolling(200).mean()
+                ibex_regime    = market_regime_df['Close'] > ibex_sma200
                 df['MarketBullish'] = ibex_regime.reindex(df.index, method='ffill').fillna(True)
+
+                # [F] RS vs IBEX
+                rs = calcular_rs_vs_ibex(df, market_regime_df, period=20)
+                df['RS_IBEX'] = rs
             else:
                 df['MarketBullish'] = True
+                df['RS_IBEX']       = 1.0
 
-            # Señal de entrada
+            # Señal de rotura diaria
             df['PrevHigh20'] = df['High'].shift(1).rolling(20).max()
-            df['Entry_Signal'] = (
+
+            # Señal de entrada completa
+            cond_base = (
                 (df['Close'] > df['PrevHigh20']) &
-                (df['VolRatio'] > 1.5) &
+                (df['VolRatio'] > vol_threshold) &
                 (df['WeeklyTrend'] == True) &
                 (df['Close'] > df['SMA200']) &
-                (df['RSI'] > 30) & (df['RSI'] < 70) &
+                (df['RSI_PRE'] > 40) & (df['RSI_PRE'] < 75) &  # [E]
+                (df['RS_IBEX'] >= 1.0) &                        # [F]
                 (df['OBV'] > df['OBV_SMA']) &
-                (df['MarketBullish'] == True)
+                (df['MarketBullish'] == True) &
+                (df['ATR_PCT'] >= atr_min_pct)                  # [B]
             )
 
-            # Simulación trade a trade
-            in_trade = False
-            entry_price = 0
-            stop = 0
-            target_price = 0
-            entry_date = None
-            trade_atr = 0
+            if weekly_confirm:
+                cond_base = cond_base & (df['WeeklyBreakout'] == True)  # [G]
 
-            ticker_trades = []
-            closes = df['Close'].values
-            atrs = df['ATR'].values
-            signals = df['Entry_Signal'].values
-            dates = df.index
+            df['Entry_Signal'] = cond_base
+            ticker_data[ticker] = df
 
-            for i in range(1, len(df)):
-                if not in_trade:
-                    if signals[i]:
-                        in_trade = True
-                        entry_price = closes[i]
-                        trade_atr = atrs[i]
-                        stop = entry_price - (trade_atr * config['atr_mult'])
-                        target_price = entry_price + ((entry_price - stop) * config['rr_ratio'])
-                        entry_date = dates[i]
-                else:
-                    # Gestión trailing stop (ajusta stop si el precio sube)
-                    new_stop = closes[i] - (atrs[i] * config['atr_mult'])
-                    stop = max(stop, new_stop)  # trailing: nunca baja
-
-                    hit_stop = closes[i] <= stop
-                    hit_target = closes[i] >= target_price
-
-                    if hit_stop or hit_target:
-                        exit_price = stop if hit_stop else target_price
-                        pnl_pct = (exit_price - entry_price) / entry_price * 100
-                        duration = (dates[i] - entry_date).days
-                        ticker_trades.append({
-                            "Ticker": ticker.replace(".MC", ""),
-                            "Empresa": NOMBRES_IBEX.get(ticker, ticker),
-                            "Entrada": entry_date.date(),
-                            "Salida": dates[i].date(),
-                            "Precio Entrada": round(entry_price, 2),
-                            "Precio Salida": round(exit_price, 2),
-                            "Resultado": "✅ Profit" if not hit_stop else "❌ Stop",
-                            "PnL %": round(pnl_pct, 2),
-                            "Duración (días)": duration
-                        })
-                        in_trade = False
-
-            if ticker_trades:
-                ticker_df = pd.DataFrame(ticker_trades)
-                all_trades_df.append(ticker_df)
-                wins = ticker_df[ticker_df['PnL %'] > 0]
-                losses = ticker_df[ticker_df['PnL %'] <= 0]
-                results.append({
-                    "Ticker": ticker.replace(".MC", ""),
-                    "Empresa": NOMBRES_IBEX.get(ticker, ticker),
-                    "Total Trades": len(ticker_df),
-                    "% Acierto": round(len(wins) / len(ticker_df) * 100, 1),
-                    "PnL Medio %": round(ticker_df['PnL %'].mean(), 2),
-                    "PnL Total %": round(ticker_df['PnL %'].sum(), 2),
-                    "Mejor Trade %": round(ticker_df['PnL %'].max(), 2),
-                    "Peor Trade %": round(ticker_df['PnL %'].min(), 2),
-                    "Duración Media": round(ticker_df['Duración (días)'].mean(), 1),
-                    "Profit Factor": round(wins['PnL %'].sum() / abs(losses['PnL %'].sum()), 2) if len(losses) > 0 and losses['PnL %'].sum() != 0 else float('inf')
-                })
-        except Exception as e:
+        except Exception:
             continue
 
-    summary_df = pd.DataFrame(results).sort_values("PnL Total %", ascending=False) if results else pd.DataFrame()
-    all_trades = pd.concat(all_trades_df, ignore_index=True) if all_trades_df else pd.DataFrame()
+    if not ticker_data:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # ── PASO 2: Simulación cronológica multi-activo con control de cartera ───
+    # Construir índice de fechas unificado
+    all_dates = sorted(set().union(*[set(df.index) for df in ticker_data.values()]))
+
+    all_trades_list = []
+
+    # Estado de posiciones abiertas: ticker → dict con info del trade
+    open_positions = {}
+    # Control de sectores ocupados: sector → ticker ocupando
+    sector_occupied = {}
+
+    for date in all_dates:
+        # ── Gestionar posiciones abiertas ──────────────────────────────────
+        tickers_to_close = []
+
+        for tkr, pos in open_positions.items():
+            df_tkr = ticker_data[tkr]
+            if date not in df_tkr.index:
+                continue
+
+            close_price = df_tkr.loc[date, 'Close']
+            atr_now     = df_tkr.loc[date, 'ATR']
+            adx_now     = df_tkr.loc[date, 'ADX'] if 'ADX' in df_tkr.columns else 25
+
+            # Trailing stop
+            new_stop = close_price - (atr_now * config['atr_mult'])
+
+            # [I] Stop mínimo garantizado: nunca a menos de 0.5R del precio actual
+            # Evita que el trailing sea tan agresivo que cierre en retrocesos normales
+            min_stop_distance = pos['initial_risk'] * 0.5
+            new_stop = min(new_stop, close_price - min_stop_distance)
+
+            if pos['breakeven_active']:
+                pos['stop'] = max(pos['stop'], new_stop, pos['entry_price'])
+            else:
+                pos['stop'] = max(pos['stop'], new_stop)
+
+            # [A] Salida parcial en 1R
+            if partial_exit and not pos['breakeven_active'] and close_price >= pos['target_partial']:
+                pos['breakeven_active'] = True
+                pos['stop'] = pos['entry_price']
+
+                pnl_mitad = (pos['target_partial'] - pos['entry_price']) / pos['entry_price'] * 100
+                duration  = (date - pos['entry_date']).days
+                all_trades_list.append({
+                    "Ticker":         tkr.replace(".MC", ""),
+                    "Empresa":        NOMBRES_IBEX.get(tkr, tkr),
+                    "Sector":         SECTOR_MAP.get(tkr, "General"),
+                    "Entrada":        pos['entry_date'].date(),
+                    "Salida":         date.date(),
+                    "Precio Entrada": round(pos['entry_price'], 2),
+                    "Precio Salida":  round(pos['target_partial'], 2),
+                    "Resultado":      "✅ Parcial (1R)",
+                    "PnL %":          round(pnl_mitad, 2),
+                    "Duración (días)": duration,
+                    "Tipo":           "1ª mitad"
+                })
+                continue  # la 2ª mitad sigue abierta
+
+            # Salida final
+            hit_stop   = close_price <= pos['stop']
+            hit_target = close_price >= pos['target_full']
+
+            if hit_stop or hit_target:
+                exit_price = pos['stop'] if hit_stop else pos['target_full']
+                pnl_pct    = (exit_price - pos['entry_price']) / pos['entry_price'] * 100
+                duration   = (date - pos['entry_date']).days
+
+                if pos['breakeven_active']:
+                    if hit_target:
+                        resultado = "✅ Target (2ª mitad)"
+                    elif abs(exit_price - pos['entry_price']) < 0.001:
+                        resultado = "⚪ Breakeven (2ª mitad)"
+                    else:
+                        resultado = "❌ Stop (2ª mitad)"
+                    tipo = "2ª mitad"
+                else:
+                    resultado = "✅ Profit" if hit_target else "❌ Stop"
+                    tipo = "Completa"
+
+                all_trades_list.append({
+                    "Ticker":         tkr.replace(".MC", ""),
+                    "Empresa":        NOMBRES_IBEX.get(tkr, tkr),
+                    "Sector":         SECTOR_MAP.get(tkr, "General"),
+                    "Entrada":        pos['entry_date'].date(),
+                    "Salida":         date.date(),
+                    "Precio Entrada": round(pos['entry_price'], 2),
+                    "Precio Salida":  round(exit_price, 2),
+                    "Resultado":      resultado,
+                    "PnL %":          round(pnl_pct, 2),
+                    "Duración (días)": duration,
+                    "Tipo":           tipo
+                })
+                tickers_to_close.append(tkr)
+
+        for tkr in tickers_to_close:
+            sector = SECTOR_MAP.get(tkr, "General")
+            open_positions.pop(tkr, None)
+            if sector_occupied.get(sector) == tkr:
+                sector_occupied.pop(sector, None)
+
+        # ── Evaluar nuevas señales ────────────────────────────────────────
+        # Candidatos del día: tickers con señal activa HOY ordenados por RS (mejor primero)
+        candidatos = []
+        for tkr, df_tkr in ticker_data.items():
+            if tkr in open_positions:
+                continue  # ya en posición
+            if date not in df_tkr.index:
+                continue
+            if not df_tkr.loc[date, 'Entry_Signal']:
+                continue
+            rs_val = df_tkr.loc[date, 'RS_IBEX'] if 'RS_IBEX' in df_tkr.columns else 1.0
+            candidatos.append((tkr, float(rs_val) if not np.isnan(float(rs_val)) else 1.0))
+
+        # Ordenar por RS descendente: primero los más fuertes vs IBEX
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+
+        for tkr, rs_val in candidatos:
+            sector = SECTOR_MAP.get(tkr, "General")
+
+            # [H] Filtro concentración sectorial: máx 1 por sector
+            if sector_limit and sector in sector_occupied:
+                continue  # sector ya ocupado, ignorar señal
+
+            df_tkr      = ticker_data[tkr]
+            entry_price = df_tkr.loc[date, 'Close']
+            atr_entry   = df_tkr.loc[date, 'ATR']
+            adx_entry   = df_tkr.loc[date, 'ADX'] if 'ADX' in df_tkr.columns else 25
+
+            initial_risk   = atr_entry * config['atr_mult']
+            stop_inicial   = entry_price - initial_risk
+            target_partial = entry_price + initial_risk  # 1R
+
+            # [D] Target dinámico según ADX
+            rr_efectivo  = 3.0 if (adx_dynamic_rr and adx_entry > 35) else config['rr_ratio']
+            target_full  = entry_price + (initial_risk * rr_efectivo)
+
+            open_positions[tkr] = {
+                'entry_price':     entry_price,
+                'initial_risk':    initial_risk,
+                'stop':            stop_inicial,
+                'target_partial':  target_partial,
+                'target_full':     target_full,
+                'breakeven_active': False,
+                'entry_date':      date,
+                'rr':              rr_efectivo
+            }
+            sector_occupied[sector] = tkr
+
+    # ── PASO 3: Compilar resultados ────────────────────────────────────────
+    if not all_trades_list:
+        return pd.DataFrame(), pd.DataFrame()
+
+    all_trades = pd.DataFrame(all_trades_list)
+
+    # Resumen por ticker
+    results = []
+    for tkr_short in all_trades['Ticker'].unique():
+        sub = all_trades[all_trades['Ticker'] == tkr_short]
+        wins   = sub[sub['PnL %'] > 0]
+        losses = sub[sub['PnL %'] <= 0]
+        pf = round(wins['PnL %'].sum() / abs(losses['PnL %'].sum()), 2) \
+             if len(losses) > 0 and losses['PnL %'].sum() != 0 else float('inf')
+        results.append({
+            "Ticker":         tkr_short,
+            "Empresa":        sub['Empresa'].iloc[0],
+            "Sector":         sub['Sector'].iloc[0],
+            "Total Trades":   len(sub),
+            "% Acierto":      round(len(wins) / len(sub) * 100, 1),
+            "PnL Medio %":    round(sub['PnL %'].mean(), 2),
+            "PnL Total %":    round(sub['PnL %'].sum(), 2),
+            "Mejor Trade %":  round(sub['PnL %'].max(), 2),
+            "Peor Trade %":   round(sub['PnL %'].min(), 2),
+            "Duración Media": round(sub['Duración (días)'].mean(), 1),
+            "Profit Factor":  pf
+        })
+
+    summary_df = pd.DataFrame(results).sort_values("PnL Total %", ascending=False)
     return summary_df, all_trades
 
 # =============================================================================
@@ -484,17 +733,58 @@ with st.sidebar:
     st.info(f"**Riesgo Max por Op.:** {risk_amount:.2f}€")
 
     with st.expander("📡 Señal de Entrada", expanded=False):
-        st.markdown("""
-        **Condiciones activas:**
-        - Cierre > Máximo 20 días
-        - Volumen > 1.5x su media
-        - EMA30 semanal alcista
-        - Precio > SMA200
-        - RSI entre 30 y 70
-        - OBV > SMA20 OBV
-        """)
+        vol_threshold = st.slider(
+            "Umbral Volumen (x media)", 1.0, 2.5, 1.5, 0.1,
+            help="1.5x = volumen al menos 50% mayor que su media. Bajar a 1.2x genera más señales; subir a 2.0x filtra más."
+        )
+        atr_min_pct = st.slider(
+            "ATR Mínimo (% del precio)", 0.5, 2.5, 1.0, 0.1,
+            help="Filtra activos inertes que raramente alcanzan el target. 1.0% = el activo debe moverse al menos 1% de su precio al día de media."
+        )
+        st.caption("Fijos: Cierre > Máx 20d · EMA30 semanal · Precio > SMA200 · RSI 30-70 · OBV alcista")
 
-    config = {'atr_mult': atr_mult, 'rr_ratio': rr_ratio}
+    with st.expander("🎯 Gestión de Salida", expanded=True):
+        partial_exit = st.toggle(
+            "Salida Parcial en 1R + Breakeven",
+            value=True,
+            help="Cierra el 50% en 1R y mueve el stop al precio de entrada. Elimina pérdidas en trades que casi llegaron al target."
+        )
+        adx_dynamic_rr = st.toggle(
+            "Target 3R cuando ADX > 35",
+            value=True,
+            help="En tendencias muy fuertes amplía el target de 2R a 3R para maximizar las mejores operaciones."
+        )
+        if partial_exit:
+            st.success("✅ Stop Breakeven activo — la 2ª mitad no puede generar pérdida.")
+        if adx_dynamic_rr:
+            st.info("📈 Target dinámico: 2R normal / 3R si ADX > 35.")
+
+    with st.expander("🏦 Control de Cartera", expanded=True):
+        sector_limit = st.toggle(
+            "Límite Concentración Sectorial",
+            value=True,
+            help="Máximo 1 posición abierta por sector simultáneamente. Evita tener BBVA + Santander + CaixaBank a la vez (es la misma apuesta × 3)."
+        )
+        weekly_confirm = st.toggle(
+            "Confirmación Semanal de Rotura",
+            value=True,
+            help="Exige que el precio también supere el máximo de las últimas 8 semanas en el marco semanal. Elimina roturas falsas dentro de rangos laterales mayores."
+        )
+        if sector_limit:
+            st.success("✅ Concentración controlada — candidatos ordenados por RS vs IBEX.")
+        if weekly_confirm:
+            st.info("📅 Doble confirmación: rotura diaria + rotura semanal 8 semanas.")
+
+    config = {
+        'atr_mult':      atr_mult,
+        'rr_ratio':      rr_ratio,
+        'vol_threshold': vol_threshold,
+        'atr_min_pct':   atr_min_pct,
+        'partial_exit':  partial_exit,
+        'adx_dynamic_rr': adx_dynamic_rr,
+        'sector_limit':  sector_limit,
+        'weekly_confirm': weekly_confirm
+    }
 
 # =============================================================================
 # 6. TABS
@@ -545,7 +835,7 @@ with tab_scanner:
                     else:
                         df = data_raw.copy().dropna()
 
-                    res = analizar_ticker(ticker, df, config, market_bullish)
+                    res = analizar_ticker(ticker, df, config, market_bullish, df_ibex=ibex_df)
                     if res:
                         resultados.append(res)
                 except:
@@ -574,24 +864,41 @@ with tab_scanner:
         min_score = st.slider("Mostrar scores ≥", -50, 100, 40, step=5)
         df_filtered = df_res[df_res['Score'] >= min_score]
 
-        cols_display = ['Ticker', 'Empresa', 'Score', 'Rotura', 'Tendencia Semanal',
-                        'Precio', 'RSI(14)', 'ADX', 'Vol Ratio', 'SMA50', 'SMA200']
+        # Columnas deseadas — solo las que existen en el DataFrame actual
+        # (evita KeyError si hay resultados cacheados de versiones anteriores)
+        cols_ideales = ['Ticker', 'Empresa', 'Score', 'Rotura', 'Tendencia Semanal',
+                        'Precio', 'RSI Actual', 'RSI Pre-Rotura', 'RS vs IBEX',
+                        'ADX', 'Vol Ratio', 'SMA50', 'SMA200']
+        cols_display = [c for c in cols_ideales if c in df_filtered.columns]
 
         df_disp = df_filtered[cols_display].copy()
-        df_disp['Precio'] = df_disp['Precio'].apply(lambda x: f"{x:.2f}€")
-        df_disp['RSI(14)'] = df_disp['RSI(14)'].apply(lambda x: f"{x:.1f}")
-        df_disp['ADX'] = df_disp['ADX'].apply(lambda x: f"{x:.1f}")
-        df_disp['Vol Ratio'] = df_disp['Vol Ratio'].apply(lambda x: f"{x:.2f}x")
-        df_disp['SMA50'] = df_disp['SMA50'].apply(lambda x: f"{x:.2f}€")
-        df_disp['SMA200'] = df_disp['SMA200'].apply(lambda x: f"{x:.2f}€")
 
-        st.dataframe(
-            df_disp.style
-            .applymap(lambda x: 'color: #00ff88' if '🟢' in str(x) else ('color: #ff0055' if '🔴' in str(x) else ''), subset=['Tendencia Semanal'])
-            .applymap(lambda x: 'color: #ff9900; font-weight: bold' if '🚨' in str(x) else '', subset=['Rotura'])
-            .background_gradient(subset=['Score'], cmap='RdYlGn', vmin=-30, vmax=110),
-            use_container_width=True
-        )
+        # Formateo defensivo por columna
+        if 'Precio'         in df_disp.columns: df_disp['Precio']         = df_disp['Precio'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
+        if 'RSI Actual'     in df_disp.columns: df_disp['RSI Actual']     = df_disp['RSI Actual'].apply(lambda x: f"{x:.1f}" if pd.notna(x) and x else "—")
+        if 'RSI Pre-Rotura' in df_disp.columns: df_disp['RSI Pre-Rotura'] = df_disp['RSI Pre-Rotura'].apply(lambda x: f"{x:.1f}" if pd.notna(x) and x else "—")
+        if 'RS vs IBEX'     in df_disp.columns: df_disp['RS vs IBEX']     = df_disp['RS vs IBEX'].apply(lambda x: f"{x:.3f}" if pd.notna(x) and x else "—")
+        if 'ADX'            in df_disp.columns: df_disp['ADX']            = df_disp['ADX'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+        if 'Vol Ratio'      in df_disp.columns: df_disp['Vol Ratio']      = df_disp['Vol Ratio'].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "—")
+        if 'SMA50'          in df_disp.columns: df_disp['SMA50']          = df_disp['SMA50'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
+        if 'SMA200'         in df_disp.columns: df_disp['SMA200']         = df_disp['SMA200'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
+
+        # Estilos defensivos — solo aplican si la columna existe
+        styled = df_disp.style
+        if 'Tendencia Semanal' in df_disp.columns:
+            styled = styled.applymap(
+                lambda x: 'color: #00ff88' if '🟢' in str(x) else ('color: #ff0055' if '🔴' in str(x) else ''),
+                subset=['Tendencia Semanal']
+            )
+        if 'Rotura' in df_disp.columns:
+            styled = styled.applymap(
+                lambda x: 'color: #ff9900; font-weight: bold' if '🚨' in str(x) else '',
+                subset=['Rotura']
+            )
+        if 'Score' in df_disp.columns:
+            styled = styled.background_gradient(subset=['Score'], cmap='RdYlGn', vmin=-30, vmax=110)
+
+        st.dataframe(styled, use_container_width=True)
 
         st.divider()
 
@@ -712,12 +1019,24 @@ with tab_scanner:
 # TAB 2 — BACKTESTING
 # ---------------------------------------------------------------------------
 with tab_backtest:
-    st.markdown("### 📊 Motor de Backtesting Vectorizado")
+    st.markdown("### 📊 Motor de Backtesting Vectorizado v3")
     st.markdown("""
     Simula la estrategia completa sobre **datos históricos reales** de cada componente del IBEX 35.
     Usa las mismas condiciones que el Scanner: rotura de máximos con volumen, EMA30 semanal, SMA200 y filtro de régimen.
-    El Stop es **trailing** (se ajusta al alza con el precio). El Target es dinámico.
     """)
+
+    # Resumen de optimizaciones activas
+    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns(4)
+    col_opt1.metric("Salida Parcial 1R",     "✅" if config.get('partial_exit') else "❌")
+    col_opt2.metric("Target ADX Dinámico",   "✅" if config.get('adx_dynamic_rr') else "❌")
+    col_opt3.metric("Límite Sectorial",      "✅" if config.get('sector_limit') else "❌")
+    col_opt4.metric("Conf. Semanal",         "✅" if config.get('weekly_confirm') else "❌")
+    col_opt5, col_opt6, col_opt7, col_opt8 = st.columns(4)
+    col_opt5.metric("RSI Pre-Rotura",        "✅ Activo")
+    col_opt6.metric("RS vs IBEX",            "✅ Activo")
+    col_opt7.metric("Umbral Volumen",         f"{config.get('vol_threshold',1.5)}x")
+    col_opt8.metric("ATR Mín.",              f"{config.get('atr_min_pct',1.0)}%")
+    st.caption("Stop Mínimo Garantizado (0.5R) siempre activo — evita trailing agresivo en retrocesos normales.")
 
     col_bt1, col_bt2 = st.columns([2, 1])
     with col_bt1:
@@ -853,10 +1172,37 @@ with tab_backtest:
 
             # Log de todas las operaciones
             st.subheader("📋 Log de Todas las Operaciones")
+
+            # Desglose por tipo de salida si hay salida parcial activa
+            if config.get('partial_exit') and 'Tipo' in all_trades.columns:
+                col_leg1, col_leg2, col_leg3 = st.columns(3)
+                parciales = all_trades[all_trades['Resultado'].str.contains('Parcial', na=False)]
+                targets   = all_trades[all_trades['Resultado'].str.contains('Target', na=False)]
+                stops     = all_trades[all_trades['Resultado'].str.contains('Stop', na=False)]
+                col_leg1.metric("🎯 Salidas en 1R (1ª mitad)", len(parciales),
+                                delta=f"Media: {parciales['PnL %'].mean():.2f}%" if len(parciales) > 0 else None)
+                col_leg2.metric("✅ Targets alcanzados (2ª mitad)", len(targets),
+                                delta=f"Media: {targets['PnL %'].mean():.2f}%" if len(targets) > 0 else None)
+                col_leg3.metric("❌ Stops / Breakevens", len(stops),
+                                delta=f"Media: {stops['PnL %'].mean():.2f}%" if len(stops) > 0 else None)
+                st.caption("Cada operación con salida parcial genera 2 filas: 1ª mitad (cerrada en 1R) y 2ª mitad (breakeven o target).")
+
+            cols_log = ['Ticker', 'Empresa', 'Sector', 'Entrada', 'Salida',
+                        'Precio Entrada', 'Precio Salida', 'Resultado', 'PnL %',
+                        'Duración (días)', 'Tipo']
+            cols_log = [c for c in cols_log if c in all_trades.columns]
+
+            def color_resultado(val):
+                if 'Parcial' in str(val): return 'color: #88ccff'
+                if '✅' in str(val): return 'color: #00ff88'
+                if '❌' in str(val): return 'color: #ff0055'
+                if '⚪' in str(val): return 'color: #aaaaaa'
+                return ''
+
             st.dataframe(
-                all_trades.sort_values('Salida', ascending=False).style
+                all_trades[cols_log].sort_values('Salida', ascending=False).style
                 .applymap(color_pnl, subset=['PnL %'])
-                .applymap(lambda x: 'color: #00ff88' if '✅' in str(x) else 'color: #ff0055', subset=['Resultado']),
+                .applymap(color_resultado, subset=['Resultado']),
                 use_container_width=True,
                 height=400
             )
@@ -866,23 +1212,30 @@ with tab_backtest:
 # ---------------------------------------------------------------------------
 with tab_manual:
     st.markdown("""
-    # 📘 Manual del Operador Swing — v2.0
+    # 📘 Manual del Operador Swing — v3.0
 
     Esta aplicación implementa una estrategia **Trend Following con Disparador de Entrada** diseñada para capturar movimientos de varias semanas dentro de tendencias establecidas.
 
     ---
 
-    ## 🌐 Filtro Maestro: Régimen de Mercado
+    ## 🆕 Cambios principales en v3.0
 
-    **Antes de cualquier análisis individual, el sistema evalúa la salud del mercado.**
+    ### El problema que se resolvió: contradicción RSI vs Rotura
 
-    - **Condición**: El IBEX 35 (índice completo) debe cotizar por encima de su SMA200.
-    - **Lógica**: "No puedes pescar peces en un estanque sin agua." En mercados bajistas, la mayoría de acciones caen independientemente de sus fundamentales. Operar largos en mercados bajistas es nadar contra la marea.
-    - **Efecto**: Si el régimen es bajista, se aplica una penalización de -30 puntos a todos los activos y se muestra advertencia en pantalla.
+    En v2.0 existía una contradicción lógica: el disparador de entrada exigía que el precio superara el máximo de 20 días (lo que implica que el precio ha subido con fuerza), pero el filtro RSI penalizaba cuando el RSI superaba 70 (lo que ocurre inevitablemente cuando el precio sube con fuerza). El sistema se bloqueaba a sí mismo en los mejores momentos de entrada.
+
+    **Solución v3.0:** Se separa el RSI en dos usos distintos con lógicas distintas.
 
     ---
 
-    ## 1. El Algoritmo de Scoring
+    ## 🌐 Filtro Maestro: Régimen de Mercado
+
+    - **Condición**: El IBEX 35 debe cotizar por encima de su SMA200.
+    - **Efecto**: Si el régimen es bajista, penalización de -30 puntos y advertencia en pantalla.
+
+    ---
+
+    ## 1. El Algoritmo de Scoring v3
 
     | Regla | Condición | Puntos |
     |-------|-----------|--------|
@@ -891,67 +1244,87 @@ with tab_manual:
     | Soporte Mayor | Precio > SMA200 diaria | +20 / -15 |
     | Tendencia Media | Precio > SMA50 diaria | +10 |
     | ADX + DI | ADX>25 y DI+>DI- | +15 / -10 |
-    | RSI Pullback | RSI en 40-60 (zona óptima) | +15 |
+    | **RSI Pre-Rotura** | **RSI medio 5d previos en 45-68** | **+15 / -10** |
     | OBV | OBV > SMA20(OBV) | +10 / -5 |
-    | Zona de Valor | Precio < 5% de SMA50 | +10 |
-    | **Disparador de Entrada** | **Rotura máximo 20 días + volumen >1.5x** | **+15** |
+    | **Fortaleza Relativa vs IBEX** | **RS 20d > 1.05** | **+15 / -10** |
+    | Zona de Valor (pullback SMA50) | Precio < 5% de SMA50 | +5 |
+    | Disparador de Entrada | Rotura máx 20d + volumen expandido | +15 |
 
     ---
 
-    ## 2. El Disparador de Entrada 🚨
+    ## 2. RSI Pre-Rotura vs RSI Actual — La corrección clave
 
-    **Este es el cambio más importante respecto a v1.0.**
+    **¿Por qué el RSI actual no sirve como filtro de entrada en roturas?**
 
-    En v1.0, el sistema era un *screener*: te decía qué activos tenían buenas condiciones, pero no *cuándo* entrar. Comprar en "condiciones técnicas favorables" sin un disparador es como saber que va a llover sin saber cuándo salir con paraguas.
+    Imagina que una acción lleva 3 semanas subiendo poco a poco y hoy finalmente supera el máximo de los últimos 20 días con volumen alto. Eso es exactamente la señal que buscamos. Pero en ese momento el RSI inevitablemente estará entre 65 y 80, porque el precio ha subido mucho en 14 días. Usar RSI < 70 como condición eliminaría esta entrada perfecta.
 
-    **Señal de Entrada v2.0**:
-    1. El precio de cierre supera el **máximo de los últimos 20 días** (rotura de resistencia reciente)
-    2. El volumen del día de rotura es **≥ 1.5x** su media de 20 días (confirmación institucional)
+    **Lo que realmente queremos saber** es si los días anteriores a la rotura el activo estaba en zona de consolidación sana, no agotado ni en caída libre. Para eso usamos el **RSI Pre-Rotura**: la media del RSI de los 5 días anteriores al día actual.
 
-    Una rotura sin volumen es una trampa. Una rotura con volumen expandido indica que hay dinero institucional detrás del movimiento.
+    | Situación | RSI Pre-Rotura | RSI día de rotura | Interpretación |
+    |-----------|---------------|-------------------|----------------|
+    | ✅ Ideal | 50-65 | 68-78 | Consolidó bien, ahora rompe con fuerza |
+    | ✅ Aceptable | 45-68 | Cualquiera | Zona sana previa |
+    | ❌ Agotado | >78 | >80 | Llegó a la rotura ya sobrecomprado |
+    | ❌ Débil | <40 | <50 | Sin momentum real antes del impulso |
 
-    ---
-
-    ## 3. Correcciones Técnicas v2.0
-
-    **ADX (Corregido)**: Ahora usa el suavizado de Wilder (EWM con alpha=1/period) en toda la cadena, incluyendo DM+, DM- y TR. Los valores son ahora consistentes con TradingView y MetaTrader.
-
-    **Adición de DI+ y DI-**: No basta con que el ADX sea alto. Un ADX alto con DI- > DI+ indica una tendencia *bajista* fuerte, no alcista. Ahora se distingue entre ambos casos.
-
-    **RSI corregido**: La zona "óptima" cambia de 50-70 a **40-60**. Esta es la zona de *pullback* dentro de una tendencia alcista, donde el precio ha corregido lo suficiente para ofrecer una entrada con buen R:R sin estar ya en sobrecompra.
-
-    **OBV añadido**: El On-Balance Volume suma el volumen de los días alcistas y resta el de los bajistas. Cuando el OBV está por encima de su media, hay más presión compradora que vendedora, confirmando la dirección del precio.
+    El RSI actual sigue mostrándose en la tabla pero como información, no como filtro.
 
     ---
 
-    ## 4. Stop Loss y Target Dinámicos
+    ## 3. Fortaleza Relativa vs IBEX (RS) — El indicador más importante añadido
 
-    **Stop Loss Trailing**: El stop se coloca a `precio - (ATR x multiplicador)`. A diferencia de v1.0 donde el stop era fijo desde la entrada, ahora el stop **sube con el precio** (trailing), protegiendo beneficios si el movimiento se desarrolla favorablemente.
+    **¿Qué mide?**
 
-    **Target Dinámico**: El objetivo no es siempre un múltiplo fijo del riesgo. El sistema comprueba el máximo de 52 semanas y ajusta el target si el precio está cerca de esa resistencia histórica, evitando objetivos irreales.
+    Compara el rendimiento del activo con el del IBEX 35 en los últimos 20 días:
+
+    `RS = (1 + rendimiento_activo_20d) / (1 + rendimiento_ibex_20d)`
+
+    - **RS > 1.05**: El activo sube un 5% más que el IBEX → Hay dinero institucional entrando específicamente en este valor (+15 puntos)
+    - **RS > 1.0**: Supera ligeramente al índice (+8 puntos)
+    - **RS ~ 1.0**: Se mueve en línea con el mercado (0 puntos)
+    - **RS < 0.95**: Va peor que el mercado → Evitar, hay distribución (-10 puntos)
+
+    **¿Por qué es tan importante?**
+
+    Un activo puede romper máximos simplemente porque todo el mercado sube. Eso no es una señal de calidad — es ruido correlacionado. Un activo que rompe máximos Y además supera al IBEX indica que hay dinero entrando específicamente en él, no solo por inercia del mercado. Es la diferencia entre surfear una ola grande y surfear una ola grande siendo el mejor surfista de la playa.
+
+    Este concepto es el núcleo del sistema SEPA de Mark Minervini y del Relative Strength Rating de IBD/Investor's Business Daily.
 
     ---
 
-    ## 5. Backtesting — Cómo Interpretar los Resultados
+    ## 4. El Disparador de Entrada: sin contradicción
 
-    | Métrica | Qué mide | Referencia |
-    |---------|----------|------------|
-    | **Tasa de Acierto** | % operaciones ganadoras | 40-60% es normal en trend following |
-    | **Profit Factor** | Suma ganancias / Suma pérdidas | >1.5 aceptable, >2.0 robusto |
-    | **Expectativa/Op.** | Ganancia esperada promedio | Debe ser positiva |
-    | **Duración Media** | Días promedio en posición | 15-40 días es swing típico |
+    **Condiciones de entrada v3 (en el backtesting y el scanner):**
 
-    > 💡 **Un sistema puede acertar solo el 40% de las veces y ser muy rentable** si el Profit Factor es alto (las ganancias son mucho mayores que las pérdidas). El Profit Factor importa más que la tasa de acierto.
+    1. Cierre > Máximo de 20 días (rotura de resistencia)
+    2. Volumen ≥ umbral configurable × su media (confirmación institucional)
+    3. EMA30 semanal alcista (tendencia de fondo)
+    4. Precio > SMA200 (sobre soporte mayor)
+    5. RSI Pre-Rotura entre 40-75 (zona sana los días previos)
+    6. RS vs IBEX ≥ 1.0 (el activo supera al índice)
+    7. OBV > SMA20 OBV (presión compradora acumulada)
+    8. IBEX en régimen alcista (SMA200)
+    9. ATR ≥ 1% del precio (volatilidad mínima para alcanzar target)
+
+    Ninguna de estas condiciones se contradice con las demás.
 
     ---
 
-    ## 6. Gestión de Riesgo — Reglas de Oro
+    ## 5. Gestión de Salida (v3)
 
-    1. **Nunca arriesgues más del 1-2%** del capital en una operación.
-    2. **El tamaño de posición lo dicta el stop, no la convicción.** Calcula siempre cuántas acciones comprar basándote en el riesgo monetario y la distancia al stop.
-    3. **El stop basado en ATR respeta la volatilidad del activo.** Un stop de 2x ATR le da al precio espacio para moverse sin que el ruido normal te saque de la operación.
-    4. **No muevas el stop a la baja nunca.** Solo puede subir (trailing hacia arriba).
-    5. **Si el mercado entra en régimen bajista (IBEX < SMA200), reduce exposición o cierra posiciones abiertas.**
+    **Stop Trailing + Salida Parcial en 1R:**
+
+    - El stop sube con el precio (trailing basado en ATR × multiplicador)
+    - Al alcanzar 1R de beneficio: se cierra el 50% y el stop se mueve a breakeven
+    - La segunda mitad busca el target completo (2R normal, 3R si ADX > 35 en entrada)
+    - Resultado: los trades que "casi llegaron" ya no son pérdidas completas
+
+    **¿Qué es 1R y 2R?**
+
+    R = distancia en euros entre precio de entrada y stop loss. Es el riesgo concreto de esa operación.
+
+    - **1R** = has ganado lo mismo que arriesgaste (precio subió = stop loss desde entrada)
+    - **2R** = has ganado el doble de lo que arriesgaste (target estándar)
+    - **3R** = ganancia triple del riesgo (solo cuando ADX > 35 al entrar)
     """)
-    st.info("⚡ Esta aplicación es una herramienta de análisis técnico. No constituye asesoramiento financiero. Opera siempre con gestión de riesgo estricta.")
-
+    st.info("⚡ Esta aplicación es una herramienta de análisis técnico educativa. No constituye asesoramiento financiero. Opera siempre con gestión de riesgo estricta.")
