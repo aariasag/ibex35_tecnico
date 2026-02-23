@@ -226,16 +226,38 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None
         prev_high_val  = prev_high_series.iloc[-1]
 
         # --- SCORING ---
+        # ┌─────────────────────────────────────────────────────────────┐
+        # │  DISTRIBUCIÓN DE PUNTOS — MÁXIMO POSITIVO EXACTO: 100 pts  │
+        # ├────────────────────────────┬────────────┬───────────────────┤
+        # │ Regla                      │ Positivo   │ Negativo          │
+        # ├────────────────────────────┼────────────┼───────────────────┤
+        # │ 1. Tendencia semanal EMA30 │ +20        │ -15               │
+        # │ 2. SMA200 (soporte mayor)  │ +20        │ -15               │
+        # │ 3. SMA50  (tend. media)    │ +10        │   0               │
+        # │ 4. ADX + DI direccional    │ +10        │ -10               │
+        # │ 5. RSI Pre-Rotura          │ +10        │  -8               │
+        # │ 6. OBV presión vol.        │ +10        │  -5               │
+        # │ 7. RS vs IBEX              │ +10        │  -8               │
+        # │ 8. Zona valor (SMA50)      │  +5        │   0               │
+        # │ 9. Disparador de entrada   │ +10        │   0               │
+        # ├────────────────────────────┼────────────┼───────────────────┤
+        # │ TOTAL MÁXIMO               │ 100        │                   │
+        # │ Filtro régimen (no cuenta) │            │ -20 (penalización)│
+        # └────────────────────────────┴────────────┴───────────────────┘
+        # El filtro de régimen de mercado es una penalización externa al
+        # sistema de 100 puntos — puede llevar el score por debajo de 0
+        # en mercados bajistas, lo cual es correcto e intencionado.
+
         score     = 0
         score_log = []
 
-        # FILTRO MAESTRO: Régimen de mercado
+        # FILTRO MAESTRO: Régimen de mercado (penalización externa, no suma al máximo)
         if not market_bullish:
-            score -= 30
+            score -= 20
             score_log.append({
                 "Regla": "🌐 Régimen de Mercado (IBEX SMA200)",
                 "Valor": "⚠️ BAJISTA",
-                "Puntos": "-30",
+                "Puntos": "-20",
                 "Detalle": "IBEX 35 por debajo de SMA200 — Sistema en modo DEFENSIVO"
             })
         else:
@@ -246,15 +268,15 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None
                 "Detalle": "IBEX 35 por encima de SMA200 — Generación de señales activa"
             })
 
-        # 1. Tendencia semanal
+        # 1. Tendencia semanal — +20 / -15
         if weekly_trend_bullish:
-            pts = 25; score += pts
+            pts = 20; score += pts
             score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🟢 Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({weekly_close:.2f}) > EMA30 ({weekly_ema30:.2f})"})
         else:
-            pts = -20; score += pts
+            pts = -15; score += pts
             score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🔴 Bajista", "Puntos": f"{pts}", "Detalle": f"Precio ({weekly_close:.2f}) < EMA30 ({weekly_ema30:.2f})"})
 
-        # 2. SMA 200
+        # 2. SMA200 — +20 / -15
         if close > sma200:
             pts = 20; score += pts
             score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "✅ Sobre soporte", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA200 ({sma200:.2f})"})
@@ -262,16 +284,16 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None
             pts = -15; score += pts
             score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "❌ Bajo soporte", "Puntos": f"{pts}", "Detalle": f"Precio ({close:.2f}) < SMA200 ({sma200:.2f})"})
 
-        # 3. SMA50
+        # 3. SMA50 — +10 / 0
         if close > sma50:
             pts = 10; score += pts
             score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "✅ Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA50 ({sma50:.2f})"})
         else:
             score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "❌ Bajista", "Puntos": "0", "Detalle": f"Precio ({close:.2f}) < SMA50 ({sma50:.2f})"})
 
-        # 4. ADX + DI direccional
+        # 4. ADX + DI — +10 / -10 / -5
         if adx_val > 25 and plus_di_val > minus_di_val:
-            pts = 15; score += pts
+            pts = 10; score += pts
             score_log.append({"Regla": "Fuerza Direccional (ADX + DI+)", "Valor": "💪 Fuerte Alcista", "Puntos": f"+{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 y DI+ ({plus_di_val:.1f}) > DI- ({minus_di_val:.1f})"})
         elif adx_val > 25 and plus_di_val < minus_di_val:
             pts = -10; score += pts
@@ -282,30 +304,24 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None
         else:
             score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"ADX ({adx_val:.1f}) en zona neutra (20-25)"})
 
-        # 5. RSI — CORREGIDO v3:
-        # Se evalúa el RSI PRE-ROTURA (5 días anteriores), no el RSI actual.
-        # Razón: en el día de la rotura el RSI DEBE estar alto (el precio está
-        # rompiendo máximos). Penalizarlo era una contradicción lógica.
-        # Lo que sí queremos saber es si los días anteriores el activo estaba
-        # en zona sana (40-68), indicando acumulación antes del impulso.
+        # 5. RSI Pre-Rotura — +10 / -8 / -5 / 0
         if not np.isnan(rsi_pre):
             if 45 <= rsi_pre <= 68:
-                pts = 15; score += pts
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🎯 Acumulación Sana", "Puntos": f"+{pts}", "Detalle": f"RSI medio 5d previos ({rsi_pre:.1f}) en zona óptima 45-68 — consolidación antes del impulso"})
+                pts = 10; score += pts
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🎯 Acumulación Sana", "Puntos": f"+{pts}", "Detalle": f"RSI medio 5d previos ({rsi_pre:.1f}) en zona óptima 45-68"})
             elif rsi_pre > 78:
-                pts = -10; score += pts
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🔴 Ya Agotado", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) > 78 — el activo llegó a la rotura sobrecomprado"})
+                pts = -8; score += pts
+                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🔴 Ya Agotado", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) > 78 — llegó a la rotura sobrecomprado"})
             elif rsi_pre < 40:
                 pts = -5; score += pts
                 score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "⚠️ Momentum Débil", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) < 40 — poco momentum antes de la rotura"})
             else:
                 score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"RSI previo ({rsi_pre:.1f}) — zona aceptable"})
-            # RSI actual informativo (no penaliza)
-            score_log.append({"Regla": "  ↳ RSI Actual (solo informativo)", "Valor": "—", "Puntos": "0", "Detalle": f"RSI hoy: {rsi_actual:.1f} — esperado alto en día de rotura, no penaliza"})
+            score_log.append({"Regla": "  ↳ RSI Actual (informativo)", "Valor": "—", "Puntos": "0", "Detalle": f"RSI hoy: {rsi_actual:.1f} — esperado alto en día de rotura, no penaliza"})
         else:
             score_log.append({"Regla": "RSI Pre-Rotura", "Valor": "⚪ Sin datos", "Puntos": "0", "Detalle": "Datos insuficientes"})
 
-        # 6. OBV — Volumen confirma dirección
+        # 6. OBV — +10 / -5
         if obv_bullish:
             pts = 10; score += pts
             score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🟢 Compradora", "Puntos": f"+{pts}", "Detalle": "OBV por encima de su SMA20 — dinero entrando"})
@@ -313,34 +329,38 @@ def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None
             pts = -5; score += pts
             score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🔴 Vendedora", "Puntos": f"{pts}", "Detalle": "OBV por debajo de su SMA20 — distribución"})
 
-        # 7. FORTALEZA RELATIVA VS IBEX (NUEVO v3)
+        # 7. Fortaleza Relativa vs IBEX — +10 / +5 / 0 / -8
         if rs_val is not None and not np.isnan(rs_val):
             if rs_val > 1.05:
-                pts = 15; score += pts
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟢 Líder de Mercado", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — sube {(rs_val-1)*100:.1f}% más que el IBEX. Dinero institucional entrando."})
+                pts = 10; score += pts
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟢 Líder de Mercado", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — sube {(rs_val-1)*100:.1f}% más que el IBEX"})
             elif rs_val > 1.0:
-                pts = 8; score += pts
+                pts = 5; score += pts
                 score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟡 Supera al Índice", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — ligeramente por encima del IBEX"})
             elif rs_val > 0.95:
                 score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ En línea con Índice", "Puntos": "0", "Detalle": f"RS 20d = {rs_val:.3f} — movimiento similar al IBEX"})
             else:
-                pts = -10; score += pts
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🔴 Rezagado", "Puntos": f"{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — el activo cae más (o sube menos) que el IBEX. Evitar."})
+                pts = -8; score += pts
+                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🔴 Rezagado", "Puntos": f"{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — cae más (o sube menos) que el IBEX"})
         else:
             score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ Sin datos IBEX", "Puntos": "0", "Detalle": "No se pudo calcular sin datos del índice"})
 
-        # 8. Zona de Valor (pullback a SMA50)
+        # 8. Zona de Valor — +5 / 0
         dist_sma50 = (close - sma50) / sma50
         if 0 < dist_sma50 < 0.05:
             pts = 5; score += pts
             score_log.append({"Regla": "Zona de Valor (Pullback SMA50)", "Valor": "🎯 Oportunidad", "Puntos": f"+{pts}", "Detalle": f"Precio dentro del 5% de SMA50 — zona de rebote potencial"})
 
-        # 9. Disparador de entrada: rotura con volumen
+        # 9. Disparador de entrada — +10 / 0
         if breakout_today:
-            pts = 15; score += pts
+            pts = 10; score += pts
             score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "✅ ROTURA ACTIVA", "Puntos": f"+{pts}", "Detalle": f"Cierre ({close:.2f}€) > Máx. 20 días ({prev_high_val:.2f}€) con volumen x{vol_ratio:.1f}"})
         else:
             score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "⏳ Sin rotura", "Puntos": "0", "Detalle": f"Precio aún no supera máx. 20 días ({prev_high_val:.2f}€)"})
+
+        # Verificación: el score nunca debe superar 100 en positivo
+        # (puede bajar de 0 por penalizaciones de régimen y señales bajistas)
+        score = min(score, 100)
 
         # --- GESTIÓN DE RIESGO ---
         stop_loss     = close - (atr * config['atr_mult'])
