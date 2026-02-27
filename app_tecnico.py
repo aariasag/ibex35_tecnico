@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
+from datetime import datetime
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
@@ -140,7 +141,426 @@ def calcular_rsi_prebreakout(rsi_series, ventana=5):
     return rsi_series.shift(1).rolling(ventana).mean()
 
 # =============================================================================
-# 2. FILTRO DE RÉGIMEN DE MERCADO (IBEX INDEX)
+# 2. PATRONES DE ANTICIPACIÓN DE ROTURA
+# =============================================================================
+# Detectan la compresión ANTES de que ocurra la rotura, dando 1-5 días de
+# ventaja para prepararse. Tres patrones complementarios:
+#
+# [VCP]  Volatility Contraction Pattern (Minervini)
+#        Correcciones decrecientes en % y rango — el precio "aprieta" antes
+#        de la expansión. Patrón estadísticamente más estudiado.
+#
+# [SQZ]  Squeeze de Bollinger + Keltner
+#        Las BB entran dentro del canal de Keltner → volatilidad en mínimos.
+#        Periodos de baja volatilidad preceden a movimientos grandes.
+#
+# [NR7]  Narrow Range 7 (y NR4)
+#        Día con el rango más pequeño de los últimos 7 (o 4) días.
+#        Máxima compresión intradiaria — señal de quietud antes del impulso.
+# =============================================================================
+
+def calcular_vcp(df, n_swings=3, max_ratio=0.6):
+    """
+    Volatility Contraction Pattern de Minervini.
+
+    Detecta si los últimos `n_swings` retrocesos forman una serie decreciente
+    donde cada corrección es significativamente menor que la anterior.
+
+    Retorna dict con:
+      - 'detectado': bool
+      - 'correcciones': list de % de cada retroceso
+      - 'ratio':  última corrección / primera (cuanto más bajo, más comprimido)
+      - 'score':  0-100 indicando la calidad del patrón
+      - 'pivot':  nivel de precio donde se espera la rotura
+      - 'dias_compresion': cuántos días lleva el activo comprimiendo
+    """
+    if len(df) < 60:
+        return {'detectado': False, 'score': 0}
+
+    close  = df['Close']
+    high   = df['High']
+    low    = df['Low']
+
+    # Encontrar máximos y mínimos locales con ventana de 5 días
+    ventana = 5
+    max_local = (high == high.rolling(ventana * 2 + 1, center=True).max())
+    min_local = (low  == low.rolling(ventana * 2 + 1, center=True).min())
+
+    idx_maximos = df.index[max_local].tolist()
+    idx_minimos = df.index[min_local].tolist()
+
+    if len(idx_maximos) < 2 or len(idx_minimos) < 2:
+        return {'detectado': False, 'score': 0}
+
+    # Tomar los últimos swings
+    ultimos_max = idx_maximos[-n_swings:]
+    ultimos_min = idx_minimos[-n_swings:]
+
+    correcciones = []
+    for i in range(min(len(ultimos_max) - 1, len(ultimos_min))):
+        m_alto  = float(high.loc[ultimos_max[i]])
+        m_bajo  = float(low.loc[ultimos_min[i]])
+        corr_pct = (m_alto - m_bajo) / m_alto * 100
+        correcciones.append(round(corr_pct, 1))
+
+    if len(correcciones) < 2:
+        return {'detectado': False, 'score': 0}
+
+    # Verificar que cada corrección es menor que la anterior
+    es_decreciente = all(correcciones[i] > correcciones[i+1]
+                         for i in range(len(correcciones) - 1))
+
+    ratio = correcciones[-1] / correcciones[0] if correcciones[0] > 0 else 1.0
+
+    # Pivot = máximo reciente = nivel de rotura esperado
+    pivot = float(high.iloc[-20:].max())
+
+    # Días de compresión = días desde el último máximo significativo
+    idx_ultimo_max = idx_maximos[-1]
+    dias_compresion = len(df.loc[idx_ultimo_max:]) - 1
+
+    # Score: mejor cuanto más decreciente y más comprimido
+    score = 0
+    if es_decreciente:
+        score += 40
+        score += max(0, int((1 - ratio) * 40))   # ratio bajo → más puntos
+        if correcciones[-1] < 5:   score += 20    # última corrección muy pequeña
+        elif correcciones[-1] < 8: score += 10
+        if 10 <= dias_compresion <= 40: score += 10  # ventana temporal ideal
+
+    return {
+        'detectado':       es_decreciente and ratio <= max_ratio,
+        'score':           min(score, 100),
+        'correcciones':    correcciones,
+        'ratio':           round(ratio, 2),
+        'pivot':           round(pivot, 2),
+        'dias_compresion': dias_compresion,
+    }
+
+
+def calcular_squeeze_bb_kc(df, bb_period=20, bb_std=2.0, kc_period=20, kc_mult=1.5):
+    """
+    Squeeze de Bollinger Bands + Keltner Channel (John Carter).
+
+    Squeeze activo cuando las BB están DENTRO del KC → volatilidad en mínimos.
+    Indica que el precio está "cargando" energía para un movimiento.
+
+    Retorna dict con:
+      - 'squeeze_activo': bool — squeeze actualmente activo
+      - 'dias_squeeze':   días consecutivos en squeeze
+      - 'histograma':     valor del momentum (positivo = alcista)
+      - 'direccion':      'alcista' / 'bajista' / 'neutral'
+      - 'score':          0-100
+    """
+    if len(df) < bb_period + 5:
+        return {'squeeze_activo': False, 'score': 0, 'dias_squeeze': 0}
+
+    close = df['Close']
+    high  = df['High']
+    low   = df['Low']
+
+    # Bollinger Bands
+    bb_mid  = close.rolling(bb_period).mean()
+    bb_std_s = close.rolling(bb_period).std()
+    bb_upper = bb_mid + bb_std * bb_std_s
+    bb_lower = bb_mid - bb_std * bb_std_s
+
+    # Keltner Channel (basado en ATR)
+    atr_s   = calcular_atr_series(df, kc_period)
+    kc_upper = bb_mid + kc_mult * atr_s
+    kc_lower = bb_mid - kc_mult * atr_s
+
+    # Squeeze: BB dentro de KC
+    squeeze = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+
+    # Días consecutivos en squeeze
+    squeeze_actual = bool(squeeze.iloc[-1])
+    dias_squeeze = 0
+    if squeeze_actual:
+        for i in range(len(squeeze) - 1, -1, -1):
+            if squeeze.iloc[i]:
+                dias_squeeze += 1
+            else:
+                break
+
+    # Momentum (simplificado): distancia del close a la media del rango reciente
+    lookback = 20
+    max_high = high.rolling(lookback).max()
+    min_low  = low.rolling(lookback).min()
+    mid_hl   = (max_high + min_low) / 2
+    mid_close = close.rolling(lookback).mean()
+    delta    = close - (mid_hl + mid_close) / 2
+    mom      = delta.ewm(span=12).mean()
+    mom_val  = float(mom.iloc[-1])
+    mom_prev = float(mom.iloc[-2]) if len(mom) > 1 else 0
+
+    if mom_val > 0 and mom_val >= mom_prev:
+        direccion = 'alcista'
+    elif mom_val > 0 and mom_val < mom_prev:
+        direccion = 'alcista_debilitando'
+    elif mom_val < 0:
+        direccion = 'bajista'
+    else:
+        direccion = 'neutral'
+
+    # Score
+    score = 0
+    if squeeze_actual:
+        score += 40
+        score += min(30, dias_squeeze * 3)   # más días → más energía acumulada
+        if direccion == 'alcista':        score += 30
+        elif direccion == 'alcista_debilitando': score += 15
+
+    return {
+        'squeeze_activo': squeeze_actual,
+        'dias_squeeze':   dias_squeeze,
+        'histograma':     round(mom_val, 4),
+        'direccion':      direccion,
+        'score':          min(score, 100),
+    }
+
+
+def calcular_nr7(df):
+    """
+    Narrow Range 7 y Narrow Range 4 (Toby Crabel).
+
+    NR7: el rango de hoy (High-Low) es el más pequeño de los últimos 7 días.
+    NR4: idem para 4 días.
+
+    Indica máxima compresión intradiaria — suele preceder a un movimiento
+    direccional fuerte en los 1-3 días siguientes.
+
+    Retorna dict con:
+      - 'nr7': bool
+      - 'nr4': bool
+      - 'rango_hoy':    rango en % del precio
+      - 'rango_medio':  rango medio 20 días en %
+      - 'compresion_pct': cuánto más pequeño es el rango vs la media (%)
+      - 'score': 0-100
+    """
+    if len(df) < 20:
+        return {'nr7': False, 'nr4': False, 'score': 0}
+
+    rango     = df['High'] - df['Low']
+    rango_pct = rango / df['Close'] * 100
+
+    rango_hoy    = float(rango_pct.iloc[-1])
+    min_7        = float(rango_pct.iloc[-7:].min())
+    min_4        = float(rango_pct.iloc[-4:].min())
+    rango_med    = float(rango_pct.iloc[-20:].mean())
+
+    nr7 = rango_hoy <= min_7
+    nr4 = rango_hoy <= min_4
+    compresion = (1 - rango_hoy / rango_med) * 100 if rango_med > 0 else 0
+
+    score = 0
+    if nr4:  score += 30
+    if nr7:  score += 40
+    score += min(30, int(compresion * 0.5))   # más comprimido vs media → más puntos
+
+    return {
+        'nr7':            nr7,
+        'nr4':            nr4,
+        'rango_hoy':      round(rango_hoy, 2),
+        'rango_medio':    round(rango_med, 2),
+        'compresion_pct': round(compresion, 1),
+        'score':          min(score, 100),
+    }
+
+
+def analizar_compresion(ticker, df, df_ibex=None):
+    """
+    Calcula los 3 patrones de compresión para un ticker y devuelve
+    un score combinado (0-100) junto con el detalle de cada patrón.
+
+    Solo considera activos en tendencia alcista (precio > SMA200)
+    para no generar falsos positivos en activos en caída.
+    """
+    try:
+        if len(df) < 260:
+            return None
+
+        close  = float(df['Close'].iloc[-1])
+        sma200 = float(df['Close'].rolling(200).mean().iloc[-1])
+        sma50  = float(df['Close'].rolling(50).mean().iloc[-1])
+
+        # Solo activos alcistas — compresión en tendencia bajista no es señal
+        if close <= sma200:
+            return None
+
+        vcp = calcular_vcp(df)
+        sqz = calcular_squeeze_bb_kc(df)
+        nr  = calcular_nr7(df)
+
+        # Score combinado ponderado
+        # VCP pesa más porque requiere más condiciones cumplidas
+        score_total = round(
+            vcp['score'] * 0.45 +
+            sqz['score'] * 0.35 +
+            nr['score']  * 0.20
+        )
+
+        # Nivel de pivot (precio objetivo de la rotura)
+        pivot = vcp.get('pivot') or float(df['High'].iloc[-20:].max())
+
+        # RS vs IBEX
+        rs_val = None
+        if df_ibex is not None and not df_ibex.empty:
+            try:
+                ret_t = float(df['Close'].pct_change(20).iloc[-1])
+                ret_i = float(df_ibex['Close'].pct_change(20)
+                              .reindex(df.index, method='ffill').iloc[-1])
+                rs_val = round((1 + ret_t) / (1 + ret_i), 3) if ret_i != 0 else 1.0
+            except Exception:
+                pass
+
+        # Descripción del estado
+        patrones_activos = []
+        if vcp['detectado']:             patrones_activos.append("VCP")
+        if sqz['squeeze_activo']:        patrones_activos.append("Squeeze")
+        if nr['nr7']:                    patrones_activos.append("NR7")
+        elif nr['nr4']:                  patrones_activos.append("NR4")
+
+        if not patrones_activos:
+            return None   # Sin patrones activos, no mostrar en la tabla
+
+        return {
+            'Ticker':         ticker.replace('.MC', ''),
+            'Empresa':        NOMBRES_IBEX.get(ticker, ticker),
+            'Score Compres.': score_total,
+            'Patrones':       ' + '.join(patrones_activos),
+            'Precio':         round(close, 2),
+            'Pivot (€)':      round(pivot, 2),
+            'Dist. Pivot %':  round((pivot - close) / close * 100, 1),
+            'RS vs IBEX':     rs_val,
+            'SMA50 ok':       '✅' if close > sma50 else '❌',
+            # Detalles por patrón
+            '_vcp':  vcp,
+            '_sqz':  sqz,
+            '_nr':   nr,
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800)   # Caché 30 min — los patrones de compresión cambian poco
+def escanear_compresion(data_raw, ibex_df):
+    """Escanea todos los tickers buscando patrones de compresión."""
+
+    def _extraer(data, ticker):
+        if not isinstance(data.columns, pd.MultiIndex):
+            return data.copy().dropna()
+        if ticker in data.columns.get_level_values(0).unique():
+            return data[ticker].copy().dropna()
+        return data.xs(ticker, axis=1, level=1).copy().dropna()
+
+    resultados = []
+    for ticker in IBEX35_TICKERS:
+        try:
+            df = _extraer(data_raw, ticker)
+            if df.empty or len(df) < 60:
+                continue
+            res = analizar_compresion(ticker, df, ibex_df)
+            if res:
+                resultados.append(res)
+        except Exception:
+            pass
+    return sorted(resultados, key=lambda x: x['Score Compres.'], reverse=True)
+
+
+# =============================================================================
+# 2. ALERTAS INTRADIARIAS — detecta roturas en formación durante la sesión
+# =============================================================================
+# Problema que resuelve: el scanner diario detecta roturas al CIERRE del día.
+# Si la rotura ocurrió a las 10:30 y el usuario mira el scanner a las 17:30,
+# entra con el movimiento ya hecho y el R:R destruido (como pasó con Endesa).
+#
+# Solución: descargar datos de 5d en intervalo 15min para cada ticker y
+# detectar si el precio está rompiendo el máximo de 20 días AHORA, durante
+# la sesión actual, con cuánto lleva subido desde el trigger y si el volumen
+# de la sesión parcial ya supera el umbral.
+
+def _extraer_ticker_df(data, ticker):
+    """
+    Extrae el DataFrame de un ticker desde un yf.download() multi-ticker.
+    Compatible con ambos formatos de MultiIndex:
+      - yfinance <0.2.38:  nivel 0 = Ticker, nivel 1 = Price  → data['ITX.MC']
+      - yfinance ≥0.2.38:  nivel 0 = Price,  nivel 1 = Ticker → data.xs('ITX.MC', level=1)
+    """
+    if not isinstance(data.columns, pd.MultiIndex):
+        return data.copy().dropna()
+    if ticker in data.columns.get_level_values(0).unique():
+        return data[ticker].copy().dropna()          # formato antiguo
+    return data.xs(ticker, axis=1, level=1).copy().dropna()  # formato nuevo
+
+
+@st.cache_data(ttl=300)  # Refresca cada 5 minutos — datos intradiarios
+def escanear_alertas_intradiarias(tickers, vol_threshold=1.5):
+    """
+    Para cada ticker, descarga datos intradiarios (15min, 5 días) y comprueba
+    si el precio actual está cruzando el máximo de 20 días diarios.
+
+    Retorna lista de dicts con las alertas activas ordenadas por urgencia.
+    """
+    df_diario_ref = yf.download(tickers, period="30d", group_by='ticker', progress=False)
+
+    alertas = []
+    for ticker in tickers:
+        try:
+            df_d = _extraer_ticker_df(df_diario_ref, ticker)
+            if len(df_d) < 21:
+                continue
+
+            nivel_rotura = df_d['High'].iloc[:-1].tail(20).max()
+
+            df_intra = yf.download(ticker, period="5d", interval="15m", progress=False)
+            if df_intra.empty:
+                continue
+            # Para descarga de un solo ticker con intervalo, yfinance a veces
+            # devuelve MultiIndex y a veces no — _extraer_ticker_df lo maneja
+            if isinstance(df_intra.columns, pd.MultiIndex):
+                try:
+                    df_intra = _extraer_ticker_df(df_intra, ticker)
+                except Exception:
+                    df_intra = df_intra.droplevel(1, axis=1) if df_intra.columns.nlevels > 1 else df_intra
+            df_intra = df_intra.dropna()
+
+            precio_actual = df_intra['Close'].iloc[-1]
+            dist_pct      = (precio_actual - nivel_rotura) / nivel_rotura * 100
+
+            vol_hoy = df_d['Volume'].iloc[-1] if len(df_d) > 0 else 0
+            vol_med = df_d['Volume'].iloc[:-1].tail(20).mean()
+            vol_ratio_hoy = vol_hoy / vol_med if vol_med > 0 else 0
+
+            if -0.5 <= dist_pct <= 5.0:
+                if dist_pct < 0:
+                    estado = "🔔 Acercándose"; urgencia = 3
+                elif dist_pct <= 1.5:
+                    estado = "🚨 Rotura Fresca"; urgencia = 1
+                elif dist_pct <= 3.0:
+                    estado = "⚠️ Entrada Tardía"; urgencia = 2
+                else:
+                    estado = "🚫 Muy Tarde"; urgencia = 4
+
+                alertas.append({
+                    "Ticker":        ticker.replace(".MC", ""),
+                    "Empresa":       NOMBRES_IBEX.get(ticker, ticker),
+                    "Estado":        estado,
+                    "Precio Actual": round(float(precio_actual), 2),
+                    "Nivel Rotura":  round(float(nivel_rotura), 2),
+                    "Dist. %":       round(float(dist_pct), 2),
+                    "Vol Hoy/Med":   round(float(vol_ratio_hoy), 2),
+                    "_urgencia":     urgencia
+                })
+        except Exception:
+            continue
+
+    alertas.sort(key=lambda x: x['_urgencia'])
+    return alertas
+
+
+# =============================================================================
+# 3. FILTRO DE RÉGIMEN DE MERCADO (IBEX INDEX)
 # =============================================================================
 
 @st.cache_data(ttl=3600)
@@ -152,251 +572,387 @@ def get_market_regime():
     try:
         df = yf.download(IBEX_INDEX, period="2y", progress=False)
         if df.empty:
-            return True, None  # Fallback: asumir alcista si no hay datos
-        df.columns = df.columns.droplevel(1) if isinstance(df.columns, pd.MultiIndex) else df.columns
+            return True, None
+        # Aplanar MultiIndex independientemente del formato
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        # Eliminar timezone del índice para compatibilidad con resample
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
         sma200 = df['Close'].rolling(200).mean()
-        last_close = df['Close'].iloc[-1]
-        last_sma200 = sma200.iloc[-1]
-        regime_bullish = last_close > last_sma200
-        return bool(regime_bullish), df
+        regime_bullish = bool(df['Close'].iloc[-1] > sma200.iloc[-1])
+        return regime_bullish, df
     except:
         return True, None
 
 # =============================================================================
-# 3. LÓGICA DE SCORING (MEJORADA)
+# 3. GMAIL — función auxiliar de envío
+# =============================================================================
+
+def _gmail_send(gmail_user: str, gmail_app_password: str,
+                destinatario: str, asunto: str, cuerpo_html: str) -> bool:
+    """
+    Envía un email HTML via Gmail SMTP (TLS, puerto 587).
+    Requiere una App Password de Google (no la contraseña habitual):
+      Cuenta Google → Seguridad → Verificación en 2 pasos → Contraseñas de aplicación
+    Retorna True si el envío tiene éxito.
+    """
+    import smtplib
+    import ssl
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = asunto
+        msg['From']    = gmail_user
+        msg['To']      = destinatario
+        msg.attach(MIMEText(cuerpo_html, 'html'))
+        context = ssl.create_default_context()
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.login(gmail_user, gmail_app_password)
+            server.sendmail(gmail_user, destinatario, msg.as_string())
+        return True
+    except Exception:
+        return False
+
+
+def _gmail_formatear_senal(empresa, ticker, precio, trigger, dist_pct,
+                            stop, target, riesgo_pct, vol_ratio, rsi_pre,
+                            rs_val, adx, rr, score) -> tuple[str, str]:
+    """Devuelve (asunto, cuerpo_html) con la señal detectada en el scanner."""
+    calidad = "✅ Óptima" if dist_pct <= 1.5 else "⚠️ Tardía"
+    rr_str  = f"3R 🔥 (ADX fuerte)" if rr >= 3.0 else f"{rr:.1f}R"
+    rs_str  = f"<br>📈 RS vs IBEX: <b>{rs_val:.3f}</b>" if rs_val else ""
+    asunto  = f"🚨 Señal IBEX 35 — {empresa} ({ticker}) · Score {score}/100"
+    cuerpo  = f"""
+    <html><body style="font-family:Arial,sans-serif;background:#1a1a1a;color:#f0f0f0;padding:20px">
+    <h2 style="color:#00ff88">🚨 SEÑAL DE COMPRA — {empresa} ({ticker})</h2>
+    <p style="font-size:18px">🏆 Score: <b style='color:#ffcc00'>{score}/100</b></p>
+    <hr style="border-color:#444">
+    <table style="width:100%;border-collapse:collapse">
+      <tr><td style="padding:6px">💰 Precio actual</td><td><b>{precio:.2f} €</b></td></tr>
+      <tr><td style="padding:6px">🎯 Trigger (rotura)</td>
+          <td><b>{trigger:.2f} €</b> <span style="color:#aaa">(+{dist_pct:.1f}% — {calidad})</span></td></tr>
+      <tr><td style="padding:6px">🛑 Stop Loss</td>
+          <td><b style='color:#ff4444'>{stop:.2f} €</b> <span style="color:#aaa">({riesgo_pct:.1f}% riesgo)</span></td></tr>
+      <tr><td style="padding:6px">🏁 Target</td>
+          <td><b style='color:#00ff88'>{target:.2f} €</b> <span style="color:#aaa">(R:R {rr_str})</span></td></tr>
+    </table>
+    <hr style="border-color:#444">
+    <p>📊 Vol x{vol_ratio:.1f} &nbsp;|&nbsp; RSI pre-rotura {rsi_pre:.0f} &nbsp;|&nbsp; ADX {adx:.0f}{rs_str}</p>
+    <p style="color:#888;font-size:12px">⚠️ No es asesoramiento financiero.</p>
+    </body></html>
+    """
+    return asunto, cuerpo
+
+
+# =============================================================================
+# 4. SCORING (LÓGICA PRINCIPAL)
 # =============================================================================
 
 def analizar_ticker(ticker, df_diario, config, market_bullish=True, df_ibex=None):
-    try:
-        if len(df_diario) < 260:
-            return None
-
-        # --- MARCO SEMANAL ---
-        df_semanal = df_diario.resample('W').agg({
-            'Open': 'first', 'High': 'max', 'Low': 'min',
-            'Close': 'last', 'Volume': 'sum'
-        }).dropna()
-        if len(df_semanal) < 52:
-            return None
-
-        df_semanal['EMA30'] = df_semanal['Close'].ewm(span=30).mean()
-        weekly_close = df_semanal['Close'].iloc[-1]
-        weekly_ema30 = df_semanal['EMA30'].iloc[-1]
-        weekly_trend_bullish = weekly_close > weekly_ema30
-
-        # --- MARCO DIARIO ---
-        close  = df_diario['Close'].iloc[-1]
-        sma50  = df_diario['Close'].rolling(50).mean().iloc[-1]
-        sma200 = df_diario['Close'].rolling(200).mean().iloc[-1]
-
-        # RSI completo — para información y scoring de contexto
-        rsi_series  = calcular_rsi(df_diario['Close'], 14)
-        rsi_actual  = rsi_series.iloc[-1]
-
-        # RSI PRE-ROTURA: media de los 5 días anteriores al día actual
-        # Mide si el activo estaba "descansando" antes del impulso actual
-        rsi_pre     = calcular_rsi_prebreakout(rsi_series, ventana=5).iloc[-1]
-
-        atr = calcular_atr_series(df_diario, 14).iloc[-1]
-        adx, plus_di, minus_di = calcular_adx(df_diario, 14)
-        adx_val      = adx.iloc[-1]
-        plus_di_val  = plus_di.iloc[-1]
-        minus_di_val = minus_di.iloc[-1]
-
-        # --- VOLUMEN ---
-        obv         = calcular_obv(df_diario)
-        obv_sma     = obv.rolling(20).mean()
-        obv_bullish = obv.iloc[-1] > obv_sma.iloc[-1]
-        vol_ratio   = calcular_volume_ratio(df_diario).iloc[-1]
-
-        # --- FORTALEZA RELATIVA VS IBEX ---
-        rs_val      = None
-        rs_bullish  = False
-        rs_20d      = None
-        if df_ibex is not None and not df_ibex.empty:
-            rs_series  = calcular_rs_vs_ibex(df_diario, df_ibex, period=20)
-            rs_val     = rs_series.iloc[-1]
-            rs_bullish = bool(rs_val > 1.0) if rs_val is not None and not np.isnan(rs_val) else False
-            rs_20d     = rs_val
-
-        # --- DISPARADOR DE ENTRADA ---
-        vol_thr = config.get('vol_threshold', 1.5)
-        breakout_series, prev_high_series, vol_ratio_series = calcular_breakout_signal(df_diario, vol_threshold=vol_thr)
-        breakout_today = breakout_series.iloc[-1]
-        prev_high_val  = prev_high_series.iloc[-1]
-
-        # --- SCORING ---
-        # ┌─────────────────────────────────────────────────────────────┐
-        # │  DISTRIBUCIÓN DE PUNTOS — MÁXIMO POSITIVO EXACTO: 100 pts  │
-        # ├────────────────────────────┬────────────┬───────────────────┤
-        # │ Regla                      │ Positivo   │ Negativo          │
-        # ├────────────────────────────┼────────────┼───────────────────┤
-        # │ 1. Tendencia semanal EMA30 │ +20        │ -15               │
-        # │ 2. SMA200 (soporte mayor)  │ +20        │ -15               │
-        # │ 3. SMA50  (tend. media)    │ +10        │   0               │
-        # │ 4. ADX + DI direccional    │ +10        │ -10               │
-        # │ 5. RSI Pre-Rotura          │ +10        │  -8               │
-        # │ 6. OBV presión vol.        │ +10        │  -5               │
-        # │ 7. RS vs IBEX              │ +10        │  -8               │
-        # │ 8. Zona valor (SMA50)      │  +5        │   0               │
-        # │ 9. Disparador de entrada   │ +10        │   0               │
-        # ├────────────────────────────┼────────────┼───────────────────┤
-        # │ TOTAL MÁXIMO               │ 100        │                   │
-        # │ Filtro régimen (no cuenta) │            │ -20 (penalización)│
-        # └────────────────────────────┴────────────┴───────────────────┘
-        # El filtro de régimen de mercado es una penalización externa al
-        # sistema de 100 puntos — puede llevar el score por debajo de 0
-        # en mercados bajistas, lo cual es correcto e intencionado.
-
-        score     = 0
-        score_log = []
-
-        # FILTRO MAESTRO: Régimen de mercado (penalización externa, no suma al máximo)
-        if not market_bullish:
-            score -= 20
-            score_log.append({
-                "Regla": "🌐 Régimen de Mercado (IBEX SMA200)",
-                "Valor": "⚠️ BAJISTA",
-                "Puntos": "-20",
-                "Detalle": "IBEX 35 por debajo de SMA200 — Sistema en modo DEFENSIVO"
-            })
-        else:
-            score_log.append({
-                "Regla": "🌐 Régimen de Mercado (IBEX SMA200)",
-                "Valor": "✅ Alcista",
-                "Puntos": "0",
-                "Detalle": "IBEX 35 por encima de SMA200 — Generación de señales activa"
-            })
-
-        # 1. Tendencia semanal — +20 / -15
-        if weekly_trend_bullish:
-            pts = 20; score += pts
-            score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🟢 Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({weekly_close:.2f}) > EMA30 ({weekly_ema30:.2f})"})
-        else:
-            pts = -15; score += pts
-            score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🔴 Bajista", "Puntos": f"{pts}", "Detalle": f"Precio ({weekly_close:.2f}) < EMA30 ({weekly_ema30:.2f})"})
-
-        # 2. SMA200 — +20 / -15
-        if close > sma200:
-            pts = 20; score += pts
-            score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "✅ Sobre soporte", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA200 ({sma200:.2f})"})
-        else:
-            pts = -15; score += pts
-            score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "❌ Bajo soporte", "Puntos": f"{pts}", "Detalle": f"Precio ({close:.2f}) < SMA200 ({sma200:.2f})"})
-
-        # 3. SMA50 — +10 / 0
-        if close > sma50:
-            pts = 10; score += pts
-            score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "✅ Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA50 ({sma50:.2f})"})
-        else:
-            score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "❌ Bajista", "Puntos": "0", "Detalle": f"Precio ({close:.2f}) < SMA50 ({sma50:.2f})"})
-
-        # 4. ADX + DI — +10 / -10 / -5
-        if adx_val > 25 and plus_di_val > minus_di_val:
-            pts = 10; score += pts
-            score_log.append({"Regla": "Fuerza Direccional (ADX + DI+)", "Valor": "💪 Fuerte Alcista", "Puntos": f"+{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 y DI+ ({plus_di_val:.1f}) > DI- ({minus_di_val:.1f})"})
-        elif adx_val > 25 and plus_di_val < minus_di_val:
-            pts = -10; score += pts
-            score_log.append({"Regla": "Fuerza Direccional (ADX + DI-)", "Valor": "⚠️ Fuerte Bajista", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 pero DI- ({minus_di_val:.1f}) domina"})
-        elif adx_val < 20:
-            pts = -5; score += pts
-            score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "😴 Débil/Lateral", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) < 20 — Mercado sin dirección"})
-        else:
-            score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"ADX ({adx_val:.1f}) en zona neutra (20-25)"})
-
-        # 5. RSI Pre-Rotura — +10 / -8 / -5 / 0
-        if not np.isnan(rsi_pre):
-            if 45 <= rsi_pre <= 68:
-                pts = 10; score += pts
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🎯 Acumulación Sana", "Puntos": f"+{pts}", "Detalle": f"RSI medio 5d previos ({rsi_pre:.1f}) en zona óptima 45-68"})
-            elif rsi_pre > 78:
-                pts = -8; score += pts
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🔴 Ya Agotado", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) > 78 — llegó a la rotura sobrecomprado"})
-            elif rsi_pre < 40:
-                pts = -5; score += pts
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "⚠️ Momentum Débil", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) < 40 — poco momentum antes de la rotura"})
-            else:
-                score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"RSI previo ({rsi_pre:.1f}) — zona aceptable"})
-            score_log.append({"Regla": "  ↳ RSI Actual (informativo)", "Valor": "—", "Puntos": "0", "Detalle": f"RSI hoy: {rsi_actual:.1f} — esperado alto en día de rotura, no penaliza"})
-        else:
-            score_log.append({"Regla": "RSI Pre-Rotura", "Valor": "⚪ Sin datos", "Puntos": "0", "Detalle": "Datos insuficientes"})
-
-        # 6. OBV — +10 / -5
-        if obv_bullish:
-            pts = 10; score += pts
-            score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🟢 Compradora", "Puntos": f"+{pts}", "Detalle": "OBV por encima de su SMA20 — dinero entrando"})
-        else:
-            pts = -5; score += pts
-            score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🔴 Vendedora", "Puntos": f"{pts}", "Detalle": "OBV por debajo de su SMA20 — distribución"})
-
-        # 7. Fortaleza Relativa vs IBEX — +10 / +5 / 0 / -8
-        if rs_val is not None and not np.isnan(rs_val):
-            if rs_val > 1.05:
-                pts = 10; score += pts
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟢 Líder de Mercado", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — sube {(rs_val-1)*100:.1f}% más que el IBEX"})
-            elif rs_val > 1.0:
-                pts = 5; score += pts
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟡 Supera al Índice", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — ligeramente por encima del IBEX"})
-            elif rs_val > 0.95:
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ En línea con Índice", "Puntos": "0", "Detalle": f"RS 20d = {rs_val:.3f} — movimiento similar al IBEX"})
-            else:
-                pts = -8; score += pts
-                score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🔴 Rezagado", "Puntos": f"{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — cae más (o sube menos) que el IBEX"})
-        else:
-            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ Sin datos IBEX", "Puntos": "0", "Detalle": "No se pudo calcular sin datos del índice"})
-
-        # 8. Zona de Valor — +5 / 0
-        dist_sma50 = (close - sma50) / sma50
-        if 0 < dist_sma50 < 0.05:
-            pts = 5; score += pts
-            score_log.append({"Regla": "Zona de Valor (Pullback SMA50)", "Valor": "🎯 Oportunidad", "Puntos": f"+{pts}", "Detalle": f"Precio dentro del 5% de SMA50 — zona de rebote potencial"})
-
-        # 9. Disparador de entrada — +10 / 0
-        if breakout_today:
-            pts = 10; score += pts
-            score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "✅ ROTURA ACTIVA", "Puntos": f"+{pts}", "Detalle": f"Cierre ({close:.2f}€) > Máx. 20 días ({prev_high_val:.2f}€) con volumen x{vol_ratio:.1f}"})
-        else:
-            score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "⏳ Sin rotura", "Puntos": "0", "Detalle": f"Precio aún no supera máx. 20 días ({prev_high_val:.2f}€)"})
-
-        # Verificación: el score nunca debe superar 100 en positivo
-        # (puede bajar de 0 por penalizaciones de régimen y señales bajistas)
-        score = min(score, 100)
-
-        # --- GESTIÓN DE RIESGO ---
-        stop_loss     = close - (atr * config['atr_mult'])
-        risk_per_share = close - stop_loss
-        risk_pct      = (risk_per_share / close) * 100
-        target_fixed  = close + (risk_per_share * config['rr_ratio'])
-        high_52w      = df_diario['High'].rolling(252).max().iloc[-1]
-        target        = min(target_fixed, high_52w * 0.98) if target_fixed > high_52w * 0.95 else target_fixed
-
-        return {
-            "Ticker":           ticker.replace(".MC", ""),
-            "Empresa":          NOMBRES_IBEX.get(ticker, ticker),
-            "Precio":           close,
-            "Score":            round(score),
-            "Tendencia Semanal": "🟢 Alcista" if weekly_trend_bullish else "🔴 Bajista",
-            "Régimen Mercado":  "🟢 Alcista" if market_bullish else "🔴 Bajista",
-            "SMA200":           sma200,
-            "SMA50":            sma50,
-            "ADX":              adx_val,
-            "DI+":              plus_di_val,
-            "DI-":              minus_di_val,
-            "RSI Actual":       rsi_actual,
-            "RSI Pre-Rotura":   round(rsi_pre, 1) if not np.isnan(rsi_pre) else None,
-            "RS vs IBEX":       round(rs_val, 3) if rs_val and not np.isnan(rs_val) else None,
-            "OBV Alcista":      obv_bullish,
-            "Vol Ratio":        vol_ratio,
-            "Rotura":           "🚨 SÍ" if breakout_today else "—",
-            "Stop Loss":        stop_loss,
-            "Target":           target,
-            "Riesgo %":         risk_pct,
-            "ATR":              atr,
-            "Score_Log":        score_log,
-            "_df":              df_diario
-        }
-    except Exception as e:
+    # No capturamos excepciones aquí — el scanner las recoge y las muestra
+    if len(df_diario) < 260:
         return None
+
+    # Eliminar timezone del índice — yfinance nuevo devuelve UTC,
+    # lo que rompe resample('W') al comparar con índices sin tz
+    if hasattr(df_diario.index, 'tz') and df_diario.index.tz is not None:
+        df_diario = df_diario.copy()
+        df_diario.index = df_diario.index.tz_localize(None)
+
+    # Normalizar nombres de columna (por si vienen en minúsculas)
+    df_diario.columns = [c.capitalize() if c.lower() in
+                         ['open','high','low','close','volume'] else c
+                         for c in df_diario.columns]
+
+    # --- MARCO SEMANAL ---
+    df_semanal = df_diario.resample('W').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min',
+        'Close': 'last', 'Volume': 'sum'
+    }).dropna()
+    if len(df_semanal) < 52:
+        return None
+
+    df_semanal['EMA30'] = df_semanal['Close'].ewm(span=30).mean()
+    weekly_close = df_semanal['Close'].iloc[-1]
+    weekly_ema30 = df_semanal['EMA30'].iloc[-1]
+    weekly_trend_bullish = weekly_close > weekly_ema30
+
+    # --- MARCO DIARIO ---
+    close  = df_diario['Close'].iloc[-1]
+    sma50  = df_diario['Close'].rolling(50).mean().iloc[-1]
+    sma200 = df_diario['Close'].rolling(200).mean().iloc[-1]
+
+    # RSI completo — para información y scoring de contexto
+    rsi_series  = calcular_rsi(df_diario['Close'], 14)
+    rsi_actual  = rsi_series.iloc[-1]
+
+    # RSI PRE-ROTURA: media de los 5 días anteriores al día actual
+    # Mide si el activo estaba "descansando" antes del impulso actual
+    rsi_pre     = calcular_rsi_prebreakout(rsi_series, ventana=5).iloc[-1]
+
+    atr = calcular_atr_series(df_diario, 14).iloc[-1]
+    adx, plus_di, minus_di = calcular_adx(df_diario, 14)
+    adx_val      = adx.iloc[-1]
+    plus_di_val  = plus_di.iloc[-1]
+    minus_di_val = minus_di.iloc[-1]
+
+    # --- VOLUMEN ---
+    obv         = calcular_obv(df_diario)
+    obv_sma     = obv.rolling(20).mean()
+    obv_bullish = obv.iloc[-1] > obv_sma.iloc[-1]
+    vol_ratio   = calcular_volume_ratio(df_diario).iloc[-1]
+
+    # --- FORTALEZA RELATIVA VS IBEX ---
+    rs_val      = None
+    rs_bullish  = False
+    rs_20d      = None
+    if df_ibex is not None and not df_ibex.empty:
+        rs_series  = calcular_rs_vs_ibex(df_diario, df_ibex, period=20)
+        rs_val     = rs_series.iloc[-1]
+        rs_bullish = bool(rs_val > 1.0) if rs_val is not None and not np.isnan(rs_val) else False
+        rs_20d     = rs_val
+
+    # --- DISPARADOR DE ENTRADA ---
+    vol_thr = config.get('vol_threshold', 1.5)
+    breakout_series, prev_high_series, vol_ratio_series = calcular_breakout_signal(df_diario, vol_threshold=vol_thr)
+    breakout_today = breakout_series.iloc[-1]
+    prev_high_val  = prev_high_series.iloc[-1]
+
+    # --- SCORING ---
+    # ┌─────────────────────────────────────────────────────────────┐
+    # │  DISTRIBUCIÓN DE PUNTOS — MÁXIMO POSITIVO EXACTO: 100 pts  │
+    # ├────────────────────────────┬────────────┬───────────────────┤
+    # │ Regla                      │ Positivo   │ Negativo          │
+    # ├────────────────────────────┼────────────┼───────────────────┤
+    # │ 1. Tendencia semanal EMA30 │ +20        │ -15               │
+    # │ 2. SMA200 (soporte mayor)  │ +20        │ -15               │
+    # │ 3. SMA50  (tend. media)    │ +10        │   0               │
+    # │ 4. ADX + DI direccional    │ +10        │ -10               │
+    # │ 5. RSI Pre-Rotura          │ +10        │  -8               │
+    # │ 6. OBV presión vol.        │ +10        │  -5               │
+    # │ 7. RS vs IBEX              │ +10        │  -8               │
+    # │ 8. Zona valor (SMA50)      │  +5        │   0               │
+    # │ 9. Disparador de entrada   │ +10        │   0               │
+    # ├────────────────────────────┼────────────┼───────────────────┤
+    # │ TOTAL MÁXIMO               │ 100        │                   │
+    # │ Filtro régimen (no cuenta) │            │ -20 (penalización)│
+    # └────────────────────────────┴────────────┴───────────────────┘
+    # El filtro de régimen de mercado es una penalización externa al
+    # sistema de 100 puntos — puede llevar el score por debajo de 0
+    # en mercados bajistas, lo cual es correcto e intencionado.
+
+    score     = 0
+    score_log = []
+
+    # FILTRO MAESTRO: Régimen de mercado (penalización externa, no suma al máximo)
+    if not market_bullish:
+        score -= 20
+        score_log.append({
+            "Regla": "🌐 Régimen de Mercado (IBEX SMA200)",
+            "Valor": "⚠️ BAJISTA",
+            "Puntos": "-20",
+            "Detalle": "IBEX 35 por debajo de SMA200 — Sistema en modo DEFENSIVO"
+        })
+    else:
+        score_log.append({
+            "Regla": "🌐 Régimen de Mercado (IBEX SMA200)",
+            "Valor": "✅ Alcista",
+            "Puntos": "0",
+            "Detalle": "IBEX 35 por encima de SMA200 — Generación de señales activa"
+        })
+
+    # 1. Tendencia semanal — +20 / -15
+    if weekly_trend_bullish:
+        pts = 20; score += pts
+        score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🟢 Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({weekly_close:.2f}) > EMA30 ({weekly_ema30:.2f})"})
+    else:
+        pts = -15; score += pts
+        score_log.append({"Regla": "Tendencia Semanal (EMA30)", "Valor": "🔴 Bajista", "Puntos": f"{pts}", "Detalle": f"Precio ({weekly_close:.2f}) < EMA30 ({weekly_ema30:.2f})"})
+
+    # 2. SMA200 — +20 / -15
+    if close > sma200:
+        pts = 20; score += pts
+        score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "✅ Sobre soporte", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA200 ({sma200:.2f})"})
+    else:
+        pts = -15; score += pts
+        score_log.append({"Regla": "Soporte Mayor (SMA200)", "Valor": "❌ Bajo soporte", "Puntos": f"{pts}", "Detalle": f"Precio ({close:.2f}) < SMA200 ({sma200:.2f})"})
+
+    # 3. SMA50 — +10 / 0
+    if close > sma50:
+        pts = 10; score += pts
+        score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "✅ Alcista", "Puntos": f"+{pts}", "Detalle": f"Precio ({close:.2f}) > SMA50 ({sma50:.2f})"})
+    else:
+        score_log.append({"Regla": "Tendencia Mediano Plazo (SMA50)", "Valor": "❌ Bajista", "Puntos": "0", "Detalle": f"Precio ({close:.2f}) < SMA50 ({sma50:.2f})"})
+
+    # 4. ADX + DI — +10 / -10 / -5
+    if adx_val > 25 and plus_di_val > minus_di_val:
+        pts = 10; score += pts
+        score_log.append({"Regla": "Fuerza Direccional (ADX + DI+)", "Valor": "💪 Fuerte Alcista", "Puntos": f"+{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 y DI+ ({plus_di_val:.1f}) > DI- ({minus_di_val:.1f})"})
+    elif adx_val > 25 and plus_di_val < minus_di_val:
+        pts = -10; score += pts
+        score_log.append({"Regla": "Fuerza Direccional (ADX + DI-)", "Valor": "⚠️ Fuerte Bajista", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) > 25 pero DI- ({minus_di_val:.1f}) domina"})
+    elif adx_val < 20:
+        pts = -5; score += pts
+        score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "😴 Débil/Lateral", "Puntos": f"{pts}", "Detalle": f"ADX ({adx_val:.1f}) < 20 — Mercado sin dirección"})
+    else:
+        score_log.append({"Regla": "Fuerza de Tendencia (ADX)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"ADX ({adx_val:.1f}) en zona neutra (20-25)"})
+
+    # 5. RSI Pre-Rotura — +10 / -8 / -5 / 0
+    if not np.isnan(rsi_pre):
+        if 45 <= rsi_pre <= 68:
+            pts = 10; score += pts
+            score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🎯 Acumulación Sana", "Puntos": f"+{pts}", "Detalle": f"RSI medio 5d previos ({rsi_pre:.1f}) en zona óptima 45-68"})
+        elif rsi_pre > 78:
+            pts = -8; score += pts
+            score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🔴 Ya Agotado", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) > 78 — llegó a la rotura sobrecomprado"})
+        elif rsi_pre < 40:
+            pts = -5; score += pts
+            score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "⚠️ Momentum Débil", "Puntos": f"{pts}", "Detalle": f"RSI previo ({rsi_pre:.1f}) < 40 — poco momentum antes de la rotura"})
+        else:
+            score_log.append({"Regla": "RSI Pre-Rotura (5d previos)", "Valor": "🟡 Neutral", "Puntos": "0", "Detalle": f"RSI previo ({rsi_pre:.1f}) — zona aceptable"})
+        score_log.append({"Regla": "  ↳ RSI Actual (informativo)", "Valor": "—", "Puntos": "0", "Detalle": f"RSI hoy: {rsi_actual:.1f} — esperado alto en día de rotura, no penaliza"})
+    else:
+        score_log.append({"Regla": "RSI Pre-Rotura", "Valor": "⚪ Sin datos", "Puntos": "0", "Detalle": "Datos insuficientes"})
+
+    # 6. OBV — +10 / -5
+    if obv_bullish:
+        pts = 10; score += pts
+        score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🟢 Compradora", "Puntos": f"+{pts}", "Detalle": "OBV por encima de su SMA20 — dinero entrando"})
+    else:
+        pts = -5; score += pts
+        score_log.append({"Regla": "Presión de Volumen (OBV)", "Valor": "🔴 Vendedora", "Puntos": f"{pts}", "Detalle": "OBV por debajo de su SMA20 — distribución"})
+
+    # 7. Fortaleza Relativa vs IBEX — +10 / +5 / 0 / -8
+    if rs_val is not None and not np.isnan(rs_val):
+        if rs_val > 1.05:
+            pts = 10; score += pts
+            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟢 Líder de Mercado", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — sube {(rs_val-1)*100:.1f}% más que el IBEX"})
+        elif rs_val > 1.0:
+            pts = 5; score += pts
+            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🟡 Supera al Índice", "Puntos": f"+{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — ligeramente por encima del IBEX"})
+        elif rs_val > 0.95:
+            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ En línea con Índice", "Puntos": "0", "Detalle": f"RS 20d = {rs_val:.3f} — movimiento similar al IBEX"})
+        else:
+            pts = -8; score += pts
+            score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "🔴 Rezagado", "Puntos": f"{pts}", "Detalle": f"RS 20d = {rs_val:.3f} — cae más (o sube menos) que el IBEX"})
+    else:
+        score_log.append({"Regla": "💪 Fortaleza Relativa vs IBEX", "Valor": "⚪ Sin datos IBEX", "Puntos": "0", "Detalle": "No se pudo calcular sin datos del índice"})
+
+    # 8. Zona de Valor — +5 / 0
+    dist_sma50 = (close - sma50) / sma50
+    if 0 < dist_sma50 < 0.05:
+        pts = 5; score += pts
+        score_log.append({"Regla": "Zona de Valor (Pullback SMA50)", "Valor": "🎯 Oportunidad", "Puntos": f"+{pts}", "Detalle": f"Precio dentro del 5% de SMA50 — zona de rebote potencial"})
+
+    # 9. Disparador de entrada — +10 / 0
+    if breakout_today:
+        pts = 10; score += pts
+        score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "✅ ROTURA ACTIVA", "Puntos": f"+{pts}", "Detalle": f"Cierre ({close:.2f}€) > Máx. 20 días ({prev_high_val:.2f}€) con volumen x{vol_ratio:.1f}"})
+    else:
+        score_log.append({"Regla": "🚨 Disparador de Entrada", "Valor": "⏳ Sin rotura", "Puntos": "0", "Detalle": f"Precio aún no supera máx. 20 días ({prev_high_val:.2f}€)"})
+
+    # 10. CALIDAD DE ENTRADA — distancia al nivel de rotura exacto
+    # Problema: el scanner se ejecuta al cierre. Si la rotura ocurrió a media
+    # sesión, el precio puede haber subido un 3-4% por encima del trigger.
+    # Entrar ahí destruye el R:R porque el recorrido ya está parcialmente hecho.
+    #
+    # Regla:
+    #   ≤ 1.5% sobre el máximo de rotura → entrada válida, sin penalización
+    #   1.5% - 3.0%                        → entrada tardía, penaliza -10 pts y alerta
+    #   > 3.0%                             → entrada muy tardía, penaliza -20 pts y alerta roja
+    #
+    # La distancia se mide respecto al prev_high_val (el nivel de rotura),
+    # no respecto al precio de ayer, para ser preciso sobre cuánto se ha
+    # "comido" el movimiento desde el trigger.
+    if prev_high_val and prev_high_val > 0:
+        dist_entrada_pct = (close - prev_high_val) / prev_high_val * 100
+    else:
+        dist_entrada_pct = 0.0
+
+    if dist_entrada_pct <= 1.5:
+        entrada_calidad = "✅ Óptima"
+        score_log.append({
+            "Regla": "📐 Calidad de Entrada",
+            "Valor": f"✅ Óptima (+{dist_entrada_pct:.1f}% sobre trigger)",
+            "Puntos": "0",
+            "Detalle": f"Precio ({close:.2f}€) está a solo {dist_entrada_pct:.1f}% del nivel de rotura ({prev_high_val:.2f}€). Entrada con R:R intacto."
+        })
+    elif dist_entrada_pct <= 3.0:
+        pts = -10; score += pts
+        entrada_calidad = "⚠️ Tardía"
+        score_log.append({
+            "Regla": "📐 Calidad de Entrada",
+            "Valor": f"⚠️ Tardía (+{dist_entrada_pct:.1f}% sobre trigger)",
+            "Puntos": f"{pts}",
+            "Detalle": f"Precio ({close:.2f}€) está {dist_entrada_pct:.1f}% por encima del trigger ({prev_high_val:.2f}€). El movimiento está parcialmente hecho. Considera esperar un pullback a {prev_high_val:.2f}€."
+        })
+    else:
+        pts = -20; score += pts
+        entrada_calidad = "🚫 Muy Tardía"
+        score_log.append({
+            "Regla": "📐 Calidad de Entrada",
+            "Valor": f"🚫 Muy Tardía (+{dist_entrada_pct:.1f}% sobre trigger)",
+            "Puntos": f"{pts}",
+            "Detalle": f"Precio ({close:.2f}€) está {dist_entrada_pct:.1f}% por encima del trigger ({prev_high_val:.2f}€). ENTRADA INVÁLIDA — el recorrido está hecho. Espera retroceso o descarta."
+        })
+
+    # Verificación: el score nunca debe superar 100 en positivo
+    # (puede bajar de 0 por penalizaciones de régimen y señales bajistas)
+    score = min(score, 100)
+
+    # --- GESTIÓN DE RIESGO ---
+    stop_loss      = close - (atr * config['atr_mult'])
+    risk_per_share = close - stop_loss
+    risk_pct       = (risk_per_share / close) * 100
+    target_fixed   = close + (risk_per_share * config['rr_ratio'])
+    high_52w       = df_diario['High'].rolling(252).max().iloc[-1]
+
+    # Cap de target: solo aplicar si el máximo de 52 semanas está
+    # SIGNIFICATIVAMENTE por encima del precio actual (>5% de margen).
+    # Si el activo ya cotiza cerca o en máximos anuales (rotura real),
+    # el cap provocaría un target por debajo del precio de entrada — absurdo.
+    margen_52w = (high_52w - close) / close if close > 0 else 0
+    if margen_52w > 0.05 and target_fixed > high_52w * 0.95:
+        target = min(target_fixed, high_52w * 0.98)
+    else:
+        target = target_fixed
+
+    # Salvaguarda final: el target NUNCA puede ser menor que entrada + 0.5R
+    # Cubre cualquier edge case (datos erróneos, activos en máximos históricos, etc.)
+    target = max(target, close + risk_per_share * 0.5)
+
+    return {
+        "Ticker":           ticker.replace(".MC", ""),
+        "Empresa":          NOMBRES_IBEX.get(ticker, ticker),
+        "Precio":           close,
+        "Score":            round(score),
+        "Tendencia Semanal": "🟢 Alcista" if weekly_trend_bullish else "🔴 Bajista",
+        "Régimen Mercado":  "🟢 Alcista" if market_bullish else "🔴 Bajista",
+        "SMA200":           sma200,
+        "SMA50":            sma50,
+        "ADX":              adx_val,
+        "DI+":              plus_di_val,
+        "DI-":              minus_di_val,
+        "RSI Actual":       rsi_actual,
+        "RSI Pre-Rotura":   round(rsi_pre, 1) if not np.isnan(rsi_pre) else None,
+        "RS vs IBEX":       round(rs_val, 3) if rs_val and not np.isnan(rs_val) else None,
+        "OBV Alcista":      obv_bullish,
+        "Vol Ratio":        vol_ratio,
+        "Rotura":           "🚨 SÍ" if breakout_today else "—",
+        "Entrada":          entrada_calidad,
+        "Dist. Trigger %":  round(dist_entrada_pct, 1),
+        "Trigger (€)":      round(prev_high_val, 2) if prev_high_val else None,
+        "Stop Loss":        stop_loss,
+        "Target":           target,
+        "Riesgo %":         risk_pct,
+        "ATR":              atr,
+        "Score_Log":        score_log,
+        "_df":              df_diario
+    }
 
 # =============================================================================
 # 4. BACKTESTING VECTORIZADO v4 — Profit Factor Maximizado
@@ -470,14 +1026,23 @@ def run_backtest(df_raw, config, market_regime_df=None):
     sector_limit   = config.get('sector_limit', True)   # [H]
     weekly_confirm = config.get('weekly_confirm', True)  # [G]
 
-    tickers = [t for t in df_raw.columns.get_level_values(0).unique() if t in IBEX35_TICKERS]
+    # Detectar tickers disponibles en cualquier formato de MultiIndex
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        lvl0 = df_raw.columns.get_level_values(0).unique().tolist()
+        lvl1 = df_raw.columns.get_level_values(1).unique().tolist()
+        # Formato nuevo (≥0.2.38): tickers en nivel 1
+        available = [t for t in lvl1 if t in IBEX35_TICKERS] or \
+                    [t for t in lvl0 if t in IBEX35_TICKERS]
+    else:
+        available = IBEX35_TICKERS
+    tickers = available
 
     # ── PASO 1: Precalcular indicadores y señales para todos los tickers ──────
     ticker_data = {}   # ticker → DataFrame con señales
 
     for ticker in tickers:
         try:
-            df = df_raw[ticker].copy().dropna()
+            df = _extraer_ticker_df(df_raw, ticker).copy().dropna()
             if len(df) < 300:
                 continue
 
@@ -795,11 +1360,54 @@ with st.sidebar:
         if weekly_confirm:
             st.info("📅 Doble confirmación: rotura diaria + rotura semanal 8 semanas.")
 
+    with st.expander("📧 Alertas Gmail", expanded=False):
+        st.markdown("""
+        **Configuración** (solo la primera vez):
+        1. Ve a [myaccount.google.com](https://myaccount.google.com) → **Seguridad**
+        2. Activa **Verificación en 2 pasos** si no la tienes
+        3. Ve a **Contraseñas de aplicación** → elige "Correo" + "Otro" → copia la contraseña de 16 caracteres
+        4. Usa esa contraseña aquí (NO tu contraseña habitual de Gmail)
+        """)
+        gmail_user = st.text_input(
+            "Tu correo Gmail",
+            value=st.session_state.get('gmail_user', ''),
+            placeholder="tunombre@gmail.com"
+        )
+        gmail_app_pw = st.text_input(
+            "App Password (16 caracteres)",
+            value=st.session_state.get('gmail_app_pw', ''),
+            type="password",
+            placeholder="xxxx xxxx xxxx xxxx"
+        )
+        gmail_dest = st.text_input(
+            "Email destinatario (puede ser el mismo u otro)",
+            value=st.session_state.get('gmail_dest', ''),
+            placeholder="destino@gmail.com"
+        )
+        if st.button("💾 Guardar y probar conexión"):
+            if gmail_user and gmail_app_pw and gmail_dest:
+                ok = _gmail_send(
+                    gmail_user, gmail_app_pw, gmail_dest,
+                    "✅ IBEX 35 — Alertas Gmail conectadas",
+                    "<h3>✅ Conexión correcta</h3><p>Recibirás alertas cuando haya señales de compra válidas.</p>"
+                )
+                if ok:
+                    st.session_state['gmail_user']   = gmail_user
+                    st.session_state['gmail_app_pw'] = gmail_app_pw
+                    st.session_state['gmail_dest']   = gmail_dest
+                    st.success("✅ Email de prueba enviado correctamente.")
+                else:
+                    st.error("❌ Fallo al enviar. Verifica el email y la App Password.")
+            else:
+                st.warning("Rellena los tres campos.")
+        if st.session_state.get('gmail_user'):
+            st.success(f"🟢 Gmail configurado · {st.session_state.get('gmail_user','')} → {st.session_state.get('gmail_dest','')}")
+
     config = {
-        'atr_mult':      atr_mult,
         'rr_ratio':      rr_ratio,
         'vol_threshold': vol_threshold,
         'atr_min_pct':   atr_min_pct,
+        'atr_mult':      atr_mult,
         'partial_exit':  partial_exit,
         'adx_dynamic_rr': adx_dynamic_rr,
         'sector_limit':  sector_limit,
@@ -810,11 +1418,185 @@ with st.sidebar:
 # 6. TABS
 # =============================================================================
 
-tab_scanner, tab_backtest, tab_manual = st.tabs([
+tab_scanner, tab_compresion, tab_backtest, tab_manual = st.tabs([
     "🚀 Scanner de Oportunidades",
+    "🔭 Radar de Compresión",
     "📊 Backtesting",
     "📘 Manual y Metodología"
 ])
+
+# ---------------------------------------------------------------------------
+# TAB 2 — RADAR DE COMPRESIÓN
+# ---------------------------------------------------------------------------
+with tab_compresion:
+    st.markdown("### 🔭 Radar de Compresión — Anticipar Roturas 1-5 Días")
+    st.caption("""
+    Detecta activos que están **cargando energía** antes de la rotura.
+    Un score alto aquí significa que en los próximos 1-5 días podría generarse
+    la señal en el Scanner. Te da tiempo para preparar la orden límite.
+    """)
+
+    if 'scan_data_raw' not in st.session_state:
+        st.info("👆 Ejecuta primero **Escanear Mercado** en la pestaña Scanner para cargar datos.")
+    else:
+        data_raw_comp = st.session_state['scan_data_raw']
+        ibex_df_comp  = st.session_state.get('ibex_df')
+
+        with st.spinner("Analizando patrones de compresión..."):
+            resultados_comp = escanear_compresion(data_raw_comp, ibex_df_comp)
+
+        if not resultados_comp:
+            st.info("No se detectan patrones de compresión activos en este momento.")
+        else:
+            # ── Tabla principal ──────────────────────────────────────────────
+            st.subheader(f"📋 {len(resultados_comp)} activos en compresión")
+
+            cols_comp = ['Ticker', 'Empresa', 'Score Compres.', 'Patrones',
+                         'Precio', 'Pivot (€)', 'Dist. Pivot %', 'RS vs IBEX', 'SMA50 ok']
+            df_comp = pd.DataFrame([
+                {k: v for k, v in r.items() if not k.startswith('_')}
+                for r in resultados_comp
+            ])
+
+            # Formateo
+            if 'Precio'        in df_comp.columns: df_comp['Precio']        = df_comp['Precio'].apply(lambda x: f"{x:.2f}€")
+            if 'Pivot (€)'     in df_comp.columns: df_comp['Pivot (€)']     = df_comp['Pivot (€)'].apply(lambda x: f"{x:.2f}€")
+            if 'Dist. Pivot %' in df_comp.columns: df_comp['Dist. Pivot %'] = df_comp['Dist. Pivot %'].apply(lambda x: f"+{x:.1f}%")
+            if 'RS vs IBEX'    in df_comp.columns: df_comp['RS vs IBEX']    = df_comp['RS vs IBEX'].apply(lambda x: f"{x:.3f}" if x else "—")
+
+            styled_comp = df_comp[cols_comp].style \
+                .background_gradient(subset=['Score Compres.'], cmap='YlOrRd', vmin=0, vmax=100) \
+                .applymap(lambda x: 'color:#00ff88;font-weight:bold' if '✅' in str(x) else
+                                    'color:#ff4444' if '❌' in str(x) else '',
+                          subset=['SMA50 ok'])
+
+            st.dataframe(styled_comp, use_container_width=True, hide_index=True)
+
+            # Leyenda de patrones
+            st.markdown("""
+            <small>
+            <b>VCP</b>: Correcciones decrecientes (Minervini) — el patrón más potente &nbsp;|&nbsp;
+            <b>Squeeze</b>: Bollinger dentro de Keltner — volatilidad en mínimos &nbsp;|&nbsp;
+            <b>NR7/NR4</b>: Día de mínimo rango — máxima compresión intradiaria
+            </small>
+            """, unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Detalle del activo seleccionado ──────────────────────────────
+            st.subheader("🔎 Detalle del patrón")
+            ticker_sel_comp = st.selectbox(
+                "Seleccionar activo",
+                [r['Ticker'] for r in resultados_comp],
+                key="sel_comp"
+            )
+            res_sel = next(r for r in resultados_comp if r['Ticker'] == ticker_sel_comp)
+            vcp = res_sel['_vcp']
+            sqz = res_sel['_sqz']
+            nr  = res_sel['_nr']
+
+            col_a, col_b, col_c = st.columns(3)
+
+            with col_a:
+                estado_vcp = "🟢 Detectado" if vcp['detectado'] else "⚪ No activo"
+                st.metric("VCP — Volatility Contraction", estado_vcp)
+                if vcp.get('correcciones'):
+                    for i, c in enumerate(vcp['correcciones'], 1):
+                        st.write(f"  Corrección {i}: **{c:.1f}%**")
+                st.write(f"Ratio compresión: **{vcp.get('ratio', '—')}**")
+                st.write(f"Días en compresión: **{vcp.get('dias_compresion', '—')}**")
+                st.write(f"Pivot esperado: **{vcp.get('pivot', '—')}€**")
+                st.progress(vcp['score'] / 100, text=f"Score VCP: {vcp['score']}/100")
+
+            with col_b:
+                estado_sqz = "🟢 Activo" if sqz['squeeze_activo'] else "⚪ No activo"
+                st.metric("Squeeze BB + Keltner", estado_sqz)
+                st.write(f"Días en squeeze: **{sqz['dias_squeeze']}**")
+                st.write(f"Momentum: **{sqz['histograma']:.4f}**")
+                dir_color = "🟢" if sqz['direccion'] == 'alcista' else "🔴" if sqz['direccion'] == 'bajista' else "🟡"
+                st.write(f"Dirección: {dir_color} **{sqz['direccion']}**")
+                st.progress(sqz['score'] / 100, text=f"Score Squeeze: {sqz['score']}/100")
+
+            with col_c:
+                estado_nr = ("🟢 NR7" if nr['nr7'] else "🟡 NR4" if nr['nr4'] else "⚪ No activo")
+                st.metric("NR7 / NR4 — Narrow Range", estado_nr)
+                st.write(f"Rango hoy: **{nr['rango_hoy']:.2f}%**")
+                st.write(f"Rango medio 20d: **{nr['rango_medio']:.2f}%**")
+                st.write(f"Compresión vs media: **{nr['compresion_pct']:.1f}%**")
+                st.progress(nr['score'] / 100, text=f"Score NR: {nr['score']}/100")
+
+            # ── Gráfico del activo ────────────────────────────────────────────
+            st.divider()
+            ticker_full_comp = ticker_sel_comp + ".MC"
+            try:
+                df_plot = data_raw_comp[ticker_full_comp].copy().dropna() \
+                          if isinstance(data_raw_comp.columns, pd.MultiIndex) \
+                          else data_raw_comp.copy().dropna()
+                df_plot = df_plot.iloc[-90:]   # Últimos 90 días
+
+                # Bollinger Bands para el gráfico
+                bb_mid   = df_plot['Close'].rolling(20).mean()
+                bb_std_p = df_plot['Close'].rolling(20).std()
+                bb_up    = bb_mid + 2 * bb_std_p
+                bb_lo    = bb_mid - 2 * bb_std_p
+
+                fig_comp = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True,
+                    row_heights=[0.75, 0.25], vertical_spacing=0.03,
+                    subplot_titles=[f"{res_sel['Empresa']} — Patrón de Compresión (90d)", "Volumen"]
+                )
+
+                # Velas
+                fig_comp.add_trace(go.Candlestick(
+                    x=df_plot.index, open=df_plot['Open'], high=df_plot['High'],
+                    low=df_plot['Low'], close=df_plot['Close'],
+                    name="Precio",
+                    increasing_line_color='#00ff88', decreasing_line_color='#ff4444'
+                ), row=1, col=1)
+
+                # Bollinger Bands
+                fig_comp.add_trace(go.Scatter(
+                    x=df_plot.index, y=bb_up, line=dict(color='rgba(100,180,255,0.5)', width=1),
+                    name="BB Superior", showlegend=False
+                ), row=1, col=1)
+                fig_comp.add_trace(go.Scatter(
+                    x=df_plot.index, y=bb_lo, line=dict(color='rgba(100,180,255,0.5)', width=1),
+                    fill='tonexty', fillcolor='rgba(100,180,255,0.05)',
+                    name="BB Inferior", showlegend=False
+                ), row=1, col=1)
+                fig_comp.add_trace(go.Scatter(
+                    x=df_plot.index, y=bb_mid, line=dict(color='rgba(100,180,255,0.4)', width=1, dash='dot'),
+                    name="BB Media", showlegend=False
+                ), row=1, col=1)
+
+                # Línea de pivot
+                pivot_val = res_sel['Pivot (€)'].replace('€', '') if isinstance(res_sel['Pivot (€)'], str) else res_sel.get('_vcp', {}).get('pivot')
+                if pivot_val:
+                    fig_comp.add_hline(
+                        y=float(str(pivot_val).replace('€','')),
+                        line=dict(color='#ffaa00', dash='dash', width=2),
+                        annotation_text=f"Pivot {pivot_val}€",
+                        row=1, col=1
+                    )
+
+                # Volumen coloreado por squeeze
+                vol_colors = ['rgba(255,100,100,0.5)' if float(v) < float(df_plot['Volume'].rolling(20).mean().iloc[i])
+                              else 'rgba(100,255,150,0.5)'
+                              for i, v in enumerate(df_plot['Volume'])]
+                fig_comp.add_trace(go.Bar(
+                    x=df_plot.index, y=df_plot['Volume'],
+                    marker_color=vol_colors, name="Volumen"
+                ), row=2, col=1)
+
+                fig_comp.update_layout(
+                    template="plotly_dark", height=500,
+                    xaxis_rangeslider_visible=False,
+                    margin=dict(t=40, b=20),
+                    legend=dict(orientation='h', y=1.05)
+                )
+                st.plotly_chart(fig_comp, use_container_width=True)
+            except Exception as e:
+                st.warning(f"No se pudo generar el gráfico: {e}")
 
 # ---------------------------------------------------------------------------
 # TAB 1 — SCANNER
@@ -839,27 +1621,131 @@ with tab_scanner:
 
     st.divider()
 
+    # ── PANEL DE ALERTAS INTRADIARIAS ─────────────────────────────────────────
+    # Resuelve el problema de "entrar tarde": muestra en tiempo casi-real
+    # qué activos están rompiendo ahora mismo y cuánto llevan subido desde el trigger.
+    with st.expander("⚡ Alertas Intradiarias — Roturas en Formación (actualiza cada 5 min)", expanded=True):
+        st.caption("""
+        Datos de 15 minutos, refresco cada 5 min. **Úsalo durante la sesión** (9:00-17:35) para ver
+        qué activos están cruzando su máximo de 20 días AHORA, antes de que la vela diaria cierre.
+        Así evitas entrar cuando el movimiento ya está hecho.
+        """)
+
+        col_al1, col_al2 = st.columns([3, 1])
+        with col_al2:
+            refrescar = st.button("🔄 Refrescar alertas")
+
+        if refrescar:
+            st.cache_data.clear()  # Fuerza re-descarga de datos intradiarios
+
+        with st.spinner("Cargando alertas intradiarias..."):
+            alertas = escanear_alertas_intradiarias(IBEX35_TICKERS, vol_threshold=config.get('vol_threshold', 1.5))
+
+        if alertas:
+            df_alertas = pd.DataFrame([{k: v for k, v in a.items() if k != '_urgencia'} for a in alertas])
+
+            def color_estado(val):
+                if '🚨' in str(val): return 'color: #ff9900; font-weight: bold'
+                if '⚠️' in str(val): return 'color: #ffcc00'
+                if '🔔' in str(val): return 'color: #88aaff'
+                if '🚫' in str(val): return 'color: #ff4444'
+                return ''
+
+            def color_dist(val):
+                try:
+                    v = float(val)
+                    if v <= 1.5:   return 'color: #00ff88; font-weight: bold'
+                    elif v <= 3.0: return 'color: #ffcc00'
+                    elif v < 0:    return 'color: #88aaff'
+                    else:          return 'color: #ff4444'
+                except: return ''
+
+            st.dataframe(
+                df_alertas.style
+                .applymap(color_estado, subset=['Estado'])
+                .applymap(color_dist, subset=['Dist. %']),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Leyenda
+            st.markdown("""
+            <small>
+            🚨 <b>Rotura Fresca</b> (0-1.5%): entrada con R:R intacto — actúa ahora &nbsp;|&nbsp;
+            ⚠️ <b>Entrada Tardía</b> (1.5-3%): R:R deteriorado, espera pullback &nbsp;|&nbsp;
+            🚫 <b>Muy Tarde</b> (+3%): descarta o espera retroceso al trigger &nbsp;|&nbsp;
+            🔔 <b>Acercándose</b> (&lt;0%): prepárate, puede romper en breve
+            </small>
+            """, unsafe_allow_html=True)
+        else:
+            st.info("No hay activos en zona de rotura ahora mismo.")
+
+    st.divider()
+
     if st.button("🚀 Escanear Mercado", type="primary"):
         with st.spinner("Descargando datos y analizando IBEX 35..."):
             progreso = st.progress(0)
             resultados = []
 
+            # ── DIAGNÓSTICO: mostrar estructura real del DataFrame ─────────────
             data_raw = yf.download(IBEX35_TICKERS, period="2y", group_by='ticker', progress=False)
+
+            with st.expander("🔬 Diagnóstico de datos (expande si no salen resultados)", expanded=False):
+                st.write(f"**Shape:** {data_raw.shape}")
+                st.write(f"**Tipo columnas:** {type(data_raw.columns).__name__}")
+                if isinstance(data_raw.columns, pd.MultiIndex):
+                    st.write(f"**Niveles:** {data_raw.columns.nlevels}")
+                    st.write(f"**Nivel 0 (muestra):** {data_raw.columns.get_level_values(0).unique().tolist()[:8]}")
+                    st.write(f"**Nivel 1 (muestra):** {data_raw.columns.get_level_values(1).unique().tolist()[:8]}")
+                else:
+                    st.write(f"**Columnas:** {data_raw.columns.tolist()}")
+                # Probar extracción del primer ticker
+                t0 = IBEX35_TICKERS[0]
+                try:
+                    df_test = _extraer_ticker_df(data_raw, t0)
+                    st.success(f"✅ Extracción de {t0}: shape={df_test.shape}, cols={df_test.columns.tolist()}")
+                    # Probar analizar_ticker directamente y mostrar el error real
+                    if hasattr(df_test.index, 'tz') and df_test.index.tz is not None:
+                        df_test.index = df_test.index.tz_localize(None)
+                    try:
+                        res_test = analizar_ticker(t0, df_test, config, market_bullish, df_ibex=ibex_df)
+                        if res_test:
+                            st.success(f"✅ analizar_ticker({t0}) devolvió resultado con score={res_test.get('Score')}")
+                        else:
+                            st.warning(f"⚠️ analizar_ticker({t0}) devolvió None — algún filtro rechaza este ticker")
+                            # Mostrar valores clave para saber cuál filtro falla
+                            import numpy as np
+                            close = float(df_test['Close'].iloc[-1])
+                            sma200 = float(df_test['Close'].rolling(200).mean().iloc[-1])
+                            prev_high = float(df_test['High'].shift(1).rolling(20).max().iloc[-1])
+                            vol_ratio = float(df_test['Volume'].iloc[-1] / df_test['Volume'].rolling(20).mean().iloc[-1])
+                            st.code(f"close={close:.2f}  sma200={sma200:.2f}  sobre_sma200={close>sma200}\nprev_high_20d={prev_high:.2f}  rotura={close>prev_high}\nvol_ratio={vol_ratio:.2f}  (umbral={config.get('vol_threshold',1.5)})\nfilas={len(df_test)}  market_bullish={market_bullish}")
+                    except Exception as e2:
+                        st.error(f"❌ analizar_ticker lanzó excepción: {type(e2).__name__}: {e2}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                except Exception as e:
+                    st.error(f"❌ Extracción de {t0} falló: {e}")
+
             st.session_state['scan_data_raw'] = data_raw
             st.session_state['ibex_df'] = ibex_df
 
+            errores_detalle = []
             for i, ticker in enumerate(IBEX35_TICKERS):
                 try:
-                    if isinstance(data_raw.columns, pd.MultiIndex):
-                        df = data_raw[ticker].copy().dropna()
-                    else:
-                        df = data_raw.copy().dropna()
-
+                    df = _extraer_ticker_df(data_raw, ticker)
+                    if df.empty or len(df) < 50:
+                        errores_detalle.append(f"{ticker}: df vacío o muy corto ({len(df)} filas)")
+                        progreso.progress((i + 1) / len(IBEX35_TICKERS))
+                        continue
+                    # Strip timezone — yfinance ≥0.2.38 devuelve índice UTC
+                    if hasattr(df.index, 'tz') and df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
                     res = analizar_ticker(ticker, df, config, market_bullish, df_ibex=ibex_df)
                     if res:
                         resultados.append(res)
-                except:
-                    pass
+                except Exception as e:
+                    errores_detalle.append(f"{ticker}: {type(e).__name__}: {e}")
                 progreso.progress((i + 1) / len(IBEX35_TICKERS))
 
             progreso.empty()
@@ -869,8 +1755,15 @@ with tab_scanner:
                 df_res = df_res.sort_values("Score", ascending=False)
                 st.session_state['scan_results'] = df_res
                 st.session_state['scan_results_full'] = resultados
+                st.session_state['scan_errors'] = errores_detalle
             else:
-                st.warning("No hay datos disponibles.")
+                st.session_state['scan_errors'] = errores_detalle
+                if errores_detalle:
+                    with st.expander("❌ Errores del scanner — expande para ver el diagnóstico", expanded=True):
+                        for e in errores_detalle[:10]:
+                            st.code(e)
+                else:
+                    st.warning("No hay datos disponibles.")
 
     if 'scan_results' in st.session_state:
         df_res = st.session_state['scan_results']
@@ -884,26 +1777,33 @@ with tab_scanner:
         min_score = st.slider("Mostrar scores ≥", -50, 100, 40, step=5)
         df_filtered = df_res[df_res['Score'] >= min_score]
 
-        # Columnas deseadas — solo las que existen en el DataFrame actual
-        # (evita KeyError si hay resultados cacheados de versiones anteriores)
-        cols_ideales = ['Ticker', 'Empresa', 'Score', 'Rotura', 'Tendencia Semanal',
+        # Columnas deseadas — incluye nuevas columnas de calidad de entrada
+        cols_ideales = ['Ticker', 'Empresa', 'Score', 'Rotura', 'Entrada',
+                        'Dist. Trigger %', 'Trigger (€)', 'Tendencia Semanal',
                         'Precio', 'RSI Actual', 'RSI Pre-Rotura', 'RS vs IBEX',
                         'ADX', 'Vol Ratio', 'SMA50', 'SMA200']
         cols_display = [c for c in cols_ideales if c in df_filtered.columns]
 
         df_disp = df_filtered[cols_display].copy()
 
-        # Formateo defensivo por columna
-        if 'Precio'         in df_disp.columns: df_disp['Precio']         = df_disp['Precio'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
-        if 'RSI Actual'     in df_disp.columns: df_disp['RSI Actual']     = df_disp['RSI Actual'].apply(lambda x: f"{x:.1f}" if pd.notna(x) and x else "—")
-        if 'RSI Pre-Rotura' in df_disp.columns: df_disp['RSI Pre-Rotura'] = df_disp['RSI Pre-Rotura'].apply(lambda x: f"{x:.1f}" if pd.notna(x) and x else "—")
-        if 'RS vs IBEX'     in df_disp.columns: df_disp['RS vs IBEX']     = df_disp['RS vs IBEX'].apply(lambda x: f"{x:.3f}" if pd.notna(x) and x else "—")
-        if 'ADX'            in df_disp.columns: df_disp['ADX']            = df_disp['ADX'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
-        if 'Vol Ratio'      in df_disp.columns: df_disp['Vol Ratio']      = df_disp['Vol Ratio'].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "—")
-        if 'SMA50'          in df_disp.columns: df_disp['SMA50']          = df_disp['SMA50'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
-        if 'SMA200'         in df_disp.columns: df_disp['SMA200']         = df_disp['SMA200'].apply(lambda x: f"{x:.2f}€" if pd.notna(x) else "—")
+        # Formateo defensivo
+        fmt = {
+            'Precio':          lambda x: f"{x:.2f}€" if pd.notna(x) else "—",
+            'Trigger (€)':     lambda x: f"{x:.2f}€" if pd.notna(x) else "—",
+            'Dist. Trigger %': lambda x: f"{x:+.1f}%" if pd.notna(x) else "—",
+            'RSI Actual':      lambda x: f"{x:.1f}" if pd.notna(x) and x else "—",
+            'RSI Pre-Rotura':  lambda x: f"{x:.1f}" if pd.notna(x) and x else "—",
+            'RS vs IBEX':      lambda x: f"{x:.3f}" if pd.notna(x) and x else "—",
+            'ADX':             lambda x: f"{x:.1f}" if pd.notna(x) else "—",
+            'Vol Ratio':       lambda x: f"{x:.2f}x" if pd.notna(x) else "—",
+            'SMA50':           lambda x: f"{x:.2f}€" if pd.notna(x) else "—",
+            'SMA200':          lambda x: f"{x:.2f}€" if pd.notna(x) else "—",
+        }
+        for col, fn in fmt.items():
+            if col in df_disp.columns:
+                df_disp[col] = df_disp[col].apply(fn)
 
-        # Estilos defensivos — solo aplican si la columna existe
+        # Estilos
         styled = df_disp.style
         if 'Tendencia Semanal' in df_disp.columns:
             styled = styled.applymap(
@@ -915,10 +1815,86 @@ with tab_scanner:
                 lambda x: 'color: #ff9900; font-weight: bold' if '🚨' in str(x) else '',
                 subset=['Rotura']
             )
+        if 'Entrada' in df_disp.columns:
+            styled = styled.applymap(
+                lambda x: ('color: #00ff88' if '✅' in str(x)
+                           else 'color: #ffcc00' if '⚠️' in str(x)
+                           else 'color: #ff4444' if '🚫' in str(x)
+                           else ''),
+                subset=['Entrada']
+            )
         if 'Score' in df_disp.columns:
             styled = styled.background_gradient(subset=['Score'], cmap='RdYlGn', vmin=-30, vmax=110)
 
         st.dataframe(styled, use_container_width=True)
+
+        # ── Botón de alertas Gmail ─────────────────────────────────────────────
+        gmail_user   = st.session_state.get('gmail_user', '')
+        gmail_app_pw = st.session_state.get('gmail_app_pw', '')
+        gmail_dest   = st.session_state.get('gmail_dest', '')
+
+        if gmail_user and gmail_app_pw and gmail_dest:
+            col_gm1, col_gm2 = st.columns([2, 1])
+            with col_gm1:
+                score_minimo_gm = st.slider(
+                    "Score mínimo para alertar por email", 50, 100, 65, 5,
+                    key="gm_score_min"
+                )
+            with col_gm2:
+                st.write("")
+                st.write("")
+                enviar_gm = st.button("📧 Enviar señales por Gmail", type="secondary")
+
+            if enviar_gm:
+                # Filtrar señales: score mínimo + rotura activa + entrada no inválida
+                senales_gm = df_res[
+                    (df_res['Score'] >= score_minimo_gm) &
+                    (df_res.get('Rotura', pd.Series()) == "🚨 SÍ") &
+                    (~df_res.get('Entrada', pd.Series('✅')).str.contains('🚫', na=False))
+                ] if 'Rotura' in df_res.columns else df_res[df_res['Score'] >= score_minimo_gm]
+
+                if senales_gm.empty:
+                    st.info("No hay señales con rotura activa y entrada válida para alertar.")
+                    _gmail_send(
+                        gmail_user, gmail_app_pw, gmail_dest,
+                        f"IBEX 35 — Sin señales válidas {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                        f"<p>Sin señales con score ≥ {score_minimo_gm} y rotura activa en este escaneo.</p>"
+                    )
+                else:
+                    enviadas = 0
+                    for _, row_gm in senales_gm.iterrows():
+                        res_full = next(
+                            (r for r in resultados_full if r['Ticker'] == row_gm['Ticker']),
+                            None
+                        )
+                        if not res_full:
+                            continue
+
+                        asunto, cuerpo = _gmail_formatear_senal(
+                            empresa    = res_full['Empresa'],
+                            ticker     = res_full['Ticker'],
+                            precio     = float(res_full['Precio']),
+                            trigger    = float(res_full.get('Trigger (€)', res_full['Precio'])),
+                            dist_pct   = float(res_full.get('Dist. Trigger %', 0)),
+                            stop       = float(res_full['Stop Loss']),
+                            target     = float(res_full['Target']),
+                            riesgo_pct = float(res_full['Riesgo %']),
+                            vol_ratio  = float(res_full['Vol Ratio']),
+                            rsi_pre    = float(res_full.get('RSI Pre-Rotura') or res_full.get('RSI Actual', 50)),
+                            rs_val     = res_full.get('RS vs IBEX'),
+                            adx        = float(res_full['ADX']),
+                            rr         = config['rr_ratio'],
+                            score      = int(res_full['Score'])
+                        )
+                        if _gmail_send(gmail_user, gmail_app_pw, gmail_dest, asunto, cuerpo):
+                            enviadas += 1
+
+                    if enviadas > 0:
+                        st.success(f"✅ {enviadas} alerta(s) enviada(s) a {gmail_dest}.")
+                    else:
+                        st.error("No se pudieron enviar los emails. Verifica las credenciales en el sidebar.")
+        else:
+            st.caption("💡 Configura Gmail en el sidebar para recibir alertas por email.")
 
         st.divider()
 
