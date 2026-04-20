@@ -1466,11 +1466,11 @@ with tab_compresion:
 
             styled_comp = df_comp[cols_comp].style \
                 .background_gradient(subset=['Score Compres.'], cmap='YlOrRd', vmin=0, vmax=100) \
-                .applymap(lambda x: 'color:#00ff88;font-weight:bold' if '✅' in str(x) else
+                .map(lambda x: 'color:#00ff88;font-weight:bold' if '✅' in str(x) else
                                     'color:#ff4444' if '❌' in str(x) else '',
                           subset=['SMA50 ok'])
 
-            st.dataframe(styled_comp, use_container_width=True, hide_index=True)
+            st.dataframe(styled_comp, width='stretch', hide_index=True)
 
             # Leyenda de patrones
             st.markdown("""
@@ -1662,9 +1662,9 @@ with tab_scanner:
 
             st.dataframe(
                 df_alertas.style
-                .applymap(color_estado, subset=['Estado'])
-                .applymap(color_dist, subset=['Dist. %']),
-                use_container_width=True,
+                .map(color_estado, subset=['Estado'])
+                .map(color_dist, subset=['Dist. %']),
+                width='stretch',
                 hide_index=True
             )
 
@@ -1806,17 +1806,17 @@ with tab_scanner:
         # Estilos
         styled = df_disp.style
         if 'Tendencia Semanal' in df_disp.columns:
-            styled = styled.applymap(
+            styled = styled.map(
                 lambda x: 'color: #00ff88' if '🟢' in str(x) else ('color: #ff0055' if '🔴' in str(x) else ''),
                 subset=['Tendencia Semanal']
             )
         if 'Rotura' in df_disp.columns:
-            styled = styled.applymap(
+            styled = styled.map(
                 lambda x: 'color: #ff9900; font-weight: bold' if '🚨' in str(x) else '',
                 subset=['Rotura']
             )
         if 'Entrada' in df_disp.columns:
-            styled = styled.applymap(
+            styled = styled.map(
                 lambda x: ('color: #00ff88' if '✅' in str(x)
                            else 'color: #ffcc00' if '⚠️' in str(x)
                            else 'color: #ff4444' if '🚫' in str(x)
@@ -1826,7 +1826,7 @@ with tab_scanner:
         if 'Score' in df_disp.columns:
             styled = styled.background_gradient(subset=['Score'], cmap='RdYlGn', vmin=-30, vmax=110)
 
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, width='stretch')
 
         # ── Botón de alertas Gmail ─────────────────────────────────────────────
         gmail_user   = st.session_state.get('gmail_user', '')
@@ -2123,10 +2123,10 @@ with tab_backtest:
 
             st.dataframe(
                 summary.style
-                .applymap(color_pnl, subset=['PnL Total %', 'PnL Medio %', 'Mejor Trade %', 'Peor Trade %'])
+                .map(color_pnl, subset=['PnL Total %', 'PnL Medio %', 'Mejor Trade %', 'Peor Trade %'])
                 .background_gradient(subset=['% Acierto'], cmap='RdYlGn', vmin=30, vmax=70)
                 .background_gradient(subset=['Profit Factor'], cmap='RdYlGn', vmin=0.5, vmax=3.0),
-                use_container_width=True
+                width='stretch'
             )
 
             # Distribución de resultados
@@ -2197,9 +2197,9 @@ with tab_backtest:
 
             st.dataframe(
                 all_trades[cols_log].sort_values('Salida', ascending=False).style
-                .applymap(color_pnl, subset=['PnL %'])
-                .applymap(color_resultado, subset=['Resultado']),
-                use_container_width=True,
+                .map(color_pnl, subset=['PnL %'])
+                .map(color_resultado, subset=['Resultado']),
+                width='stretch',
                 height=400
             )
 
